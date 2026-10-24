@@ -1,5 +1,7 @@
 # V6Link
 
+[English](README.en.md) | 简体中文
+
 [![CI](https://github.com/HarryXiaoCN/V6Link/actions/workflows/ci.yml/badge.svg)](https://github.com/HarryXiaoCN/V6Link/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
@@ -297,6 +299,7 @@ v6link/
   vault.py        AES-256-GCM 加密本地状态
   filestore.py    随机访问的加密附件容器
   netutil.py      IPv6 解析、地址发现、文件名安全
+  sharecard.py    名片解析（无 Qt 依赖）
   updates.py      版本比较、更新包签名/校验、暂存与 PowerShell 原地安装
   engine/         网络引擎（facade + 服务）
     core.py       ChatEngine facade、生命周期、跨服务编排
@@ -393,6 +396,8 @@ powershell -ExecutionPolicy Bypass -File .\packaging\build_exe.ps1
 $env:PYTHONPATH = "."
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+无 IPv6 回环的环境（例如 GitHub 托管 runner）会自动跳过 IPv6 端到端用例；也可以设置 `V6LINK_SKIP_E2E=1` 显式跳过。
 
 ---
 
