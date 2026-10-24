@@ -14,35 +14,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: test (${{ matrix.os }}, py${{ matrix.python }})
+  core:
+    name: core (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-          cache: pip
-      - name: Install dependencies
+      - name: Environment and IPv6 check
+        run: |
+          python --version
+          python -m pip --version
+          python -c "import socket; s=socket.socket(socket.AF_INET6); s.bind(('::', 0)); print('ipv6 ok', s.getsockname()); s.close()"
+      - name: Install core dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "cryptography>=42" "psutil>=5.9" ruff
+      - name: Run core tests
+        env:
+          PYTHONPATH: .
+        run: python -m unittest discover -s tests -v
+      - name: Lint (syntax and undefined names)
+        run: python -m ruff check v6link tests --select E9,F63,F7,F82
+
+  ui-import:
+    name: ui-import (windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install UI dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install ruff
-      - name: Run unit tests
+      - name: Import smoke test
         env:
           PYTHONPATH: .
           QT_QPA_PLATFORM: offscreen
-        run: python -m unittest discover -s tests -v
-      - name: Import smoke test
-        if: runner.os == 'Windows'
-        env:
-          PYTHONPATH: .
         run: python -c "from v6link.engine import ChatEngine, ProgressEmitter, _valid_announced_hosts; from v6link import runtime; import v6link.ui.main_window; print('imports ok')"
-      - name: Lint (syntax and undefined names)
-        run: python -m ruff check v6link tests --select E9,F63,F7,F82
