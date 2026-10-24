@@ -1,0 +1,79 @@
+name: Bug report
+description: 报告一个可复现的问题
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先搜索已有 issue。**安全漏洞不要公开提 issue**，请按 [SECURITY.md](../blob/main/SECURITY.md) 的私密渠道报告。
+  - type: input
+    id: version
+    attributes:
+      label: V6Link 版本
+      placeholder: "0.3.0（界面「设置」或 `--version`）"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - Windows 10/11
+        - Linux
+        - macOS
+        - 其他
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 运行方式
+      options:
+        - 单文件 exe
+        - 源码 python main.py
+        - pip install -e .
+    validations:
+      required: true
+  - type: input
+    id: network
+    attributes:
+      label: IPv6 与网络环境
+      description: 双方是否有公网 IPv6、是否同一局域网、是否放行入站 TCP、是否使用 VPN/代理
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 ...
+        2. 点击 ...
+        3. 看到 ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或截图
+      description: 请先删除身份指纹、真实 IPv6 地址、消息内容和文件名等隐私信息
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 我已搜索过已有 issue
+          required: true
+        - label: 这不是安全漏洞（否则请走私密报告）
+          required: true

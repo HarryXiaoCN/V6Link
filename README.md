@@ -1,5 +1,10 @@
 # V6Link
 
+[![CI](https://github.com/HarryXiaoCN/V6Link/actions/workflows/ci.yml/badge.svg)](https://github.com/HarryXiaoCN/V6Link/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
+
 **基于 IPv6 的点对点加密通讯工具。** 不经过中心服务器，消息和文件直接在两个设备之间传输。
 
 ![V6Link 主界面](screenshots/main-window.png)
@@ -293,12 +298,12 @@ v6link/
   filestore.py    随机访问的加密附件容器
   netutil.py      IPv6 解析、地址发现、文件名安全
   updates.py      版本比较、更新包签名/校验、暂存与 PowerShell 原地安装
-  engine/         网络引擎包，按职责拆分
-    core.py       ChatEngine 组合
-    connections.py / messaging.py / contacts.py
-    inbound_files.py / outbound_files.py / exports.py
-    updates.py    更新邀请、数据拉取与落盘校验
-    lifecycle.py / events.py / models.py
+  engine/         网络引擎（facade + 服务）
+    core.py       ChatEngine facade、生命周期、跨服务编排
+    connections.py / contacts.py / messaging.py / updates.py
+    files/        文件传输：inbound / outbound / exports / service
+    router.py     入站命令分发
+    events.py / tasks.py / transport.py / models.py
   runtime.py      后台 asyncio 线程与线程安全 API
   ui/
     app.py        应用入口、单实例锁
@@ -399,7 +404,7 @@ V6Link 会固定好友的 Ed25519 身份指纹。该提示表示当前连接到�
 
 > **0.3.0 起支持好友互推版本更新**：新版一方可通过加密直连把程序本体推给旧版好友，对方确认、校验后自动替换并重启；0.2.2 起，接收完成自动保存到可配置下载目录，并从加密问候中学习对方最新 IPv6 地址；0.2.1 起文件卡片支持打开本地所在文件夹；0.2.0 起，文件传输需要接收确认，并支持取消/暂停/续传；0.1.2 起名片只包含全局/可路由 IPv6 地址，不再包含 `::1` 回环地址和 `fe80::` 链路本地地址；导入旧名片时也会忽略这两类地址。0.1.1 已修复本机自连被误报为身份变化的问题。
 
-如果确实是身份变化，当前替代做法是双方核对新指纹后重新交换名片；旧版本需要删除并重新添加联系人。升级到 0.2.2 后，建议让对方重新生成名片。
+如果确实是身份变化，当前替代做法是双方核对新指纹后重新交换名片；旧版本需要删除并重新添加联系人。升级到 0.3.0 后，建议让对方重新生成名片。
 
 ### 对方 IP 变化后回复失败
 
@@ -450,6 +455,28 @@ V6Link 没有中心服务器或地址目录。只有对方主动向本机发起�
 也可以使用 `--data-dir` 指定。
 
 **备份提醒**：`vault.v6` 和 `vault.key` 必须一起备份，且 `vault.key` 由当前 Windows 用户的 DPAPI 保护。把数据复制到另一台电脑或另一个 Windows 用户后通常会无法解密。当前版本没有跨机器迁移或密码导出功能。
+
+---
+
+## 许可
+
+V6Link 以 [MIT](LICENSE) 许可发布，Copyright (c) 2026 HarryXiaoCN。
+
+第三方组件（PySide6/Qt、cryptography、psutil 等）的许可与二进制分发注意事项见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 贡献
+
+欢迎 issue 和 PR。提交前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；参与讨论即表示同意 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
+
+安全漏洞请**不要**公开提 issue，按 [SECURITY.md](SECURITY.md) 的私密渠道报告。
+
+## 作者
+
+HarryXiaoCN
+
+## 致谢
+
+感谢 PySide6/Qt、cryptography、psutil 等开源项目，以及所有提交 issue 和测试反馈的人。
 
 
 

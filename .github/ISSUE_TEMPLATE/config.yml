@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞（私密）
+    url: https://github.com/HarryXiaoCN/V6Link/security/advisories/new
+    about: 请不要在公开 issue 中披露安全漏洞
+  - name: 使用与调试问题
+    url: https://github.com/HarryXiaoCN/V6Link/discussions
+    about: 连接排查、防火墙、IPv6 配置等使用问题

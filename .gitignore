@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
@@ -14,6 +14,13 @@ dist/
 *.v6
 vault.key
 attachments/
+updates/
+*.part
+
+# Test / lint caches
+.coverage
+htmlcov/
+.mypy_cache/
 
 # Local capture artifacts
 ui-smoke.png
