@@ -369,7 +369,7 @@ class InstallPlanTests(unittest.TestCase):
             self.assertIn("V6Link.exe.old-", plan.backup.name)
             self.assertIn("app''s dir", text)
             self.assertIn("Get-Process -Id $oldProcessId", text)
-            self.assertIn(str(staged), text)
+            self.assertIn(str(plan.staged), text)
             self.assertTrue(plan.script.name.endswith(".ps1"))
 
     def test_install_rejects_tampered_or_foreign_staged_files(self):

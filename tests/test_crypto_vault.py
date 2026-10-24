@@ -198,7 +198,7 @@ class EncryptedVaultTests(unittest.TestCase):
 
     def test_incoming_filename_is_sanitized(self):
         self.assertEqual(sanitize_filename("../../evil.txt"), "evil.txt")
-        self.assertEqual(sanitize_filename("a:b?.zip"), "b_.zip")
+        self.assertEqual(sanitize_filename("a:b?.zip"), "a_b_.zip")
 
     def test_endpoint_parsing(self):
         self.assertEqual(parse_endpoint("2001:db8::1"), ("2001:db8::1", 4455))

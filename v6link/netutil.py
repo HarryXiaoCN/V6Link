@@ -1,4 +1,4 @@
-﻿"""IPv6 endpoint helpers, local address discovery, and text formatting."""
+"""IPv6 endpoint helpers, local address discovery, and text formatting."""
 
 from __future__ import annotations
 
@@ -153,7 +153,11 @@ _ALLOWED_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def sanitize_filename(name: str, fallback: str = "file") -> str:
-    value = os.path.basename(str(name).replace("\\", "/")).strip()
+    # Strip any path part with plain string handling: os.path.basename follows
+    # platform rules, so on Windows "a:b?.zip" would lose its "a:" prefix as a
+    # drive letter while Linux keeps it. Received filenames must sanitize the
+    # same way on every platform.
+    value = str(name).replace("\\", "/").rsplit("/", 1)[-1].strip()
     value = _ALLOWED_FILENAME.sub("_", value)
     value = value.strip(" .")
     if not value:
