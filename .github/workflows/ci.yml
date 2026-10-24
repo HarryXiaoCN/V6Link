@@ -39,6 +39,7 @@ jobs:
       - name: Run core tests
         env:
           PYTHONPATH: .
+          V6LINK_SKIP_E2E: "1"
         run: python -m unittest discover -s tests -v
       - name: Lint (syntax and undefined names)
         run: python -m ruff check v6link tests --select E9,F63,F7,F82

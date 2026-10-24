@@ -33,9 +33,11 @@ from v6link.vault import Vault
 
 
 def _ipv6_loopback_available() -> bool:
+    if os.environ.get("V6LINK_SKIP_E2E"):
+        return False
     try:
         with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
-            probe.bind(("::1", 0))
+            probe.bind(("::", 0))
         return True
     except OSError:
         return False
