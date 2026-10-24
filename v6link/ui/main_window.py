@@ -166,7 +166,7 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self._restore_maximized = False
         self._load_latest_messages()
-        self.setWindowTitle("V6Link")
+        self.setWindowTitle(f"V6Link {__version__}")
         self.setWindowIcon(QIcon(logo_pixmap(64)))
         self.resize(1220, 800)
         self.setMinimumSize(1040, 680)
@@ -430,7 +430,7 @@ class MainWindow(QMainWindow):
         self.selected_id = ""
         self.sidebar.set_selected("")
         self.stack.setCurrentWidget(self.welcome)
-        self.setWindowTitle("V6Link")
+        self.setWindowTitle(f"V6Link {__version__}")
 
     def select_contact(self, contact_id: str) -> None:
         contact = self.contacts.get(contact_id)
@@ -445,7 +445,7 @@ class MainWindow(QMainWindow):
         self.chat.load_messages(messages)
         self._refresh_contacts()
         self.nav_chat.setChecked(True)
-        self.setWindowTitle(f"V6Link · {contact.get('name', '好友')}")
+        self.setWindowTitle(f"V6Link {__version__} · {contact.get('name', '好友')}")
         QTimer.singleShot(30, self.chat.focus_composer)
 
     # ------------------------------------------------------------------ events
@@ -754,7 +754,7 @@ class MainWindow(QMainWindow):
                 self._notify_tray(sender, preview[:160])
         self._refresh_contacts()
         if self.selected_id == contact_id:
-            self.setWindowTitle(f"V6Link · {contact.get('name', '好友')}")
+            self.setWindowTitle(f"V6Link {__version__} · {contact.get('name', '好友')}")
 
     def _on_message_updated(self, message: dict[str, Any]) -> None:
         if not message:

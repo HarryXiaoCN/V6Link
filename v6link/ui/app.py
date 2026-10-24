@@ -92,7 +92,8 @@ def run(argv: list[str] | None = None) -> int:
     # 主窗口隐藏到系统托盘后仍需接收消息。真正退出只由关闭窗口或托盘菜单触发。
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_NAME)
-    app.setApplicationDisplayName(APP_NAME)
+    # 窗口标题由 MainWindow 自己设置；清空 display name 避免标题栏出现两次 "V6Link"。
+    app.setApplicationDisplayName("")
     app.setOrganizationName("V6Link")
     app.setApplicationVersion(__version__)
     app.setWindowIcon(QIcon(logo_pixmap(64)))
