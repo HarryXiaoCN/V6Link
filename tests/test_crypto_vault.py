@@ -28,7 +28,7 @@ from v6link.netutil import (
     sanitize_filename,
     shareable_ipv6_addresses,
 )
-from v6link.ui.dialogs import parse_share_card
+from v6link.sharecard import parse_share_card
 from v6link.vault import Vault
 
 
