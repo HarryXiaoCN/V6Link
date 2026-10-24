@@ -254,7 +254,11 @@ v6link/
   vault.py        AES-256-GCM 加密本地状态
   filestore.py    随机访问的加密附件容器
   netutil.py      IPv6 解析、地址发现、文件名安全
-  engine.py       IPv6 监听、好友认证、消息与并行文件传输
+  engine/         网络引擎包，按职责拆分
+    core.py       ChatEngine 组合
+    connections.py / messaging.py / contacts.py
+    inbound_files.py / outbound_files.py / exports.py
+    lifecycle.py / events.py / models.py
   runtime.py      后台 asyncio 线程与线程安全 API
   ui/
     app.py        应用入口、单实例锁

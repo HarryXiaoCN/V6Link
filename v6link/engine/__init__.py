@@ -1,0 +1,43 @@
+"""Public networking-engine API for V6Link."""
+
+from .core import ChatEngine
+from .models import (
+    ProgressEmitter,
+    _valid_announced_hosts,
+    EventSink,
+    log,
+    APP_WIRE_NAME,
+    PROTOCOL,
+    CONNECT_TIMEOUT,
+    CONTROL_TIMEOUT,
+    ACK_TIMEOUT,
+    FILE_CONSENT_TIMEOUT,
+    FILE_OFFER_TIMEOUT,
+    FILE_RESULT_TIMEOUT,
+    MAX_TEXT_BYTES,
+    MAX_FILE_BYTES,
+    MAX_STREAMS,
+    MAX_ACTIVE_INBOUND,
+    DISK_RESERVE,
+)
+
+__all__ = [
+    "ChatEngine",
+    "ProgressEmitter",
+    "_valid_announced_hosts",
+    "EventSink",
+    "log",
+    "APP_WIRE_NAME",
+    "PROTOCOL",
+    "CONNECT_TIMEOUT",
+    "CONTROL_TIMEOUT",
+    "ACK_TIMEOUT",
+    "FILE_CONSENT_TIMEOUT",
+    "FILE_OFFER_TIMEOUT",
+    "FILE_RESULT_TIMEOUT",
+    "MAX_TEXT_BYTES",
+    "MAX_FILE_BYTES",
+    "MAX_STREAMS",
+    "MAX_ACTIVE_INBOUND",
+    "DISK_RESERVE",
+]
