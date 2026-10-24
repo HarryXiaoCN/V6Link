@@ -1,4 +1,4 @@
-﻿"""Shared exception types with user-presentable messages."""
+"""Shared exception types with user-presentable messages."""
 
 
 class V6LinkError(Exception):
@@ -35,3 +35,7 @@ class PeerApprovalRequired(V6LinkError):
 
 class TransferError(V6LinkError):
     """A file transfer failed."""
+
+
+class UpdateError(V6LinkError):
+    """An application update offer, download or install was rejected."""

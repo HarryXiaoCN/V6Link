@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import __version__
 from ..crypto import (
     EncryptedSession,
 )
@@ -23,12 +24,14 @@ from ..errors import (
     PeerApprovalRequired,
     PeerUnreachable,
     TransferError,
+    UpdateError,
 )
 from ..filestore import MAX_CHUNK, MIN_CHUNK, AttachmentWriter
 
 log = logging.getLogger("v6link.engine")
 
 APP_WIRE_NAME = "V6Link"
+APP_VERSION = __version__
 PROTOCOL = 2
 CONNECT_TIMEOUT = 4.0
 CONTROL_TIMEOUT = 15.0
@@ -36,6 +39,8 @@ ACK_TIMEOUT = 30.0
 FILE_CONSENT_TIMEOUT = 120.0
 FILE_OFFER_TIMEOUT = 150.0
 FILE_RESULT_TIMEOUT = 180.0
+UPDATE_OFFER_TTL = 600.0
+UPDATE_DATA_TIMEOUT = 60.0
 MAX_TEXT_BYTES = 256 * 1024
 MAX_FILE_BYTES = 1024 * 1024 * 1024 * 1024
 MAX_STREAMS = 8
@@ -367,7 +372,17 @@ def _parse_control_payload(body: bytes) -> dict[str, Any]:
 
 
 def _friendly_error(exc: BaseException) -> str:
-    if isinstance(exc, (PeerUnreachable, PeerApprovalRequired, IdentityMismatch, HandshakeError, TransferError)):
+    if isinstance(
+        exc,
+        (
+            PeerUnreachable,
+            PeerApprovalRequired,
+            IdentityMismatch,
+            HandshakeError,
+            TransferError,
+            UpdateError,
+        ),
+    ):
         return str(exc)
     if isinstance(exc, asyncio.CancelledError):
         return "操作已取消"

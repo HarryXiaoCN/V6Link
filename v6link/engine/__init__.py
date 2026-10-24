@@ -6,6 +6,7 @@ from .models import (
     _valid_announced_hosts,
     EventSink,
     log,
+    APP_VERSION,
     APP_WIRE_NAME,
     PROTOCOL,
     CONNECT_TIMEOUT,
@@ -19,6 +20,8 @@ from .models import (
     MAX_STREAMS,
     MAX_ACTIVE_INBOUND,
     DISK_RESERVE,
+    UPDATE_OFFER_TTL,
+    UPDATE_DATA_TIMEOUT,
 )
 
 __all__ = [
@@ -27,6 +30,7 @@ __all__ = [
     "_valid_announced_hosts",
     "EventSink",
     "log",
+    "APP_VERSION",
     "APP_WIRE_NAME",
     "PROTOCOL",
     "CONNECT_TIMEOUT",
@@ -40,4 +44,6 @@ __all__ = [
     "MAX_STREAMS",
     "MAX_ACTIVE_INBOUND",
     "DISK_RESERVE",
+    "UPDATE_OFFER_TTL",
+    "UPDATE_DATA_TIMEOUT",
 ]

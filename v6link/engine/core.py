@@ -10,24 +10,35 @@ from ..crypto import (
     Identity,
 )
 from ..vault import Vault
-
-from .models import (
-    EventSink,
-    _PendingFileOffer,
-    _OutboundFile,
-    _InboundTransfer,
-)
-from .events import _EventMixin
-from .lifecycle import _LifecycleMixin
 from .connections import _ConnectionMixin
-from .messaging import _MessagingMixin
 from .contacts import _ContactMixin
-from .inbound_files import _InboundFileMixin
-from .outbound_files import _OutboundFileMixin
+from .events import _EventMixin
 from .exports import _ExportMixin
+from .inbound_files import _InboundFileMixin
+from .lifecycle import _LifecycleMixin
+from .messaging import _MessagingMixin
+from .models import (
+    APP_VERSION,
+    EventSink,
+    _InboundTransfer,
+    _OutboundFile,
+    _PendingFileOffer,
+)
+from .outbound_files import _OutboundFileMixin
+from .updates import _IncomingUpdate, _OutgoingUpdate, _UpdateMixin
 
 
-class ChatEngine(_EventMixin, _LifecycleMixin, _ConnectionMixin, _MessagingMixin, _ContactMixin, _InboundFileMixin, _OutboundFileMixin, _ExportMixin):
+class ChatEngine(
+    _EventMixin,
+    _LifecycleMixin,
+    _ConnectionMixin,
+    _MessagingMixin,
+    _ContactMixin,
+    _InboundFileMixin,
+    _OutboundFileMixin,
+    _UpdateMixin,
+    _ExportMixin,
+):
     """Owns the IPv6 listener, encrypted sessions, and outgoing transfers."""
 
     def __init__(
@@ -38,9 +49,11 @@ class ChatEngine(_EventMixin, _LifecycleMixin, _ConnectionMixin, _MessagingMixin
         bind_host: str = "::",
         listen_port: int | None = None,
         downloads_dir: str | Path | None = None,
+        version: str = APP_VERSION,
     ):
         self.vault = vault
         self.identity: Identity = vault.identity()
+        self.version = str(version or APP_VERSION)
         self.bind_host = bind_host
         profile = vault.profile()
         settings = vault.settings()
@@ -64,6 +77,8 @@ class ChatEngine(_EventMixin, _LifecycleMixin, _ConnectionMixin, _MessagingMixin
         self._active_inbound: dict[str, _InboundTransfer] = {}
         self._pending_offers: dict[str, _PendingFileOffer] = {}
         self._outbound_files: dict[str, _OutboundFile] = {}
+        self._outgoing_updates: dict[str, _OutgoingUpdate] = {}
+        self._incoming_updates: dict[str, _IncomingUpdate] = {}
         self._file_locks: dict[str, asyncio.Lock] = {}
         self._started = False
         self._stopping = False

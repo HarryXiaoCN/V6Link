@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
+import json
 import logging
 import sys
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, Qt
@@ -16,6 +19,7 @@ from .. import APP_NAME, __version__
 from ..errors import VaultError
 from ..keyvault import default_data_dir
 from ..runtime import BackendRuntime
+from ..updates import cleanup_on_start, is_frozen, running_executable
 from ..vault import Vault
 from .bridge import EventBridge
 from .icons import logo_pixmap
@@ -31,6 +35,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=None, help="覆盖本地加密数据目录")
     parser.add_argument("--port", type=int, default=None, help="覆盖本次启动的 IPv6 监听端口")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="输出运行环境诊断信息后退出（用于排查单文件打包路径）",
+    )
     return parser.parse_args(argv)
 
 
@@ -50,6 +59,27 @@ def _fatal(message: str) -> int:
     box.setText(message)
     box.exec()
     return 1
+
+
+def _diagnose() -> int:
+    """Print runtime paths so one-file builds can be debugged from a console."""
+    payload = {
+        "version": __version__,
+        "platform": sys.platform,
+        "frozen": is_frozen(),
+        "sys.executable": sys.executable,
+        "sys._MEIPASS": getattr(sys, "_MEIPASS", None),
+        "persisted_executable": str(running_executable() or ""),
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    with contextlib.suppress(Exception):
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    with contextlib.suppress(OSError):
+        (Path(tempfile.gettempdir()) / "v6link-diagnose.json").write_text(
+            text, encoding="utf-8"
+        )
+    return 0
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -74,6 +104,10 @@ def run(argv: list[str] | None = None) -> int:
         data_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return _fatal(f"无法创建数据目录：\n{data_dir}\n\n{exc}")
+    # A previous peer-pushed update may have left a swap script or partial
+    # download behind; neither is needed once this instance is starting.
+    with contextlib.suppress(Exception):
+        cleanup_on_start(data_dir)
 
     lock = QLockFile(str(data_dir / "app.lock"))
     lock.setStaleLockTime(5000)
@@ -120,6 +154,8 @@ def run(argv: list[str] | None = None) -> int:
 
 
 def main() -> int:
+    if "--diagnose" in sys.argv[1:]:
+        return _diagnose()
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

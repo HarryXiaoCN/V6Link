@@ -1,4 +1,4 @@
-﻿"""Background asyncio runtime so cryptography and disk I/O never block Qt."""
+"""Background asyncio runtime so cryptography and disk I/O never block Qt."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from typing import Any
 
 from .engine import ChatEngine
 from .errors import V6LinkError
+from .updates import InstallPlan, launch_install, prepare_install
 from .vault import Vault
 
 log = logging.getLogger("v6link.runtime")
@@ -192,6 +193,38 @@ class BackendRuntime:
 
     def open_attachment(self, message_id: str) -> concurrent.futures.Future:
         return self._invoke("open_attachment", message_id, scope="attachment")
+
+    def push_update(self, contact_id: str, notes: str = "") -> concurrent.futures.Future:
+        return self._invoke("push_update", contact_id, notes, scope="update")
+
+    def respond_update_offer(self, offer_id: str, accepted: bool) -> concurrent.futures.Future:
+        return self._invoke("respond_update_offer", offer_id, accepted, scope="update")
+
+    def cancel_update(self, offer_id: str) -> concurrent.futures.Future:
+        return self._invoke("cancel_update", offer_id, scope="update")
+
+    def install_update(
+        self,
+        path: str | Path,
+        *,
+        version: str,
+        sha256: str,
+        size: int,
+    ) -> InstallPlan:
+        """Verify a staged payload and hand the swap to a detached script.
+
+        Runs on the caller's thread: this is local disk work that must finish
+        before the GUI exits, and it never touches the engine event loop.
+        """
+        plan = prepare_install(
+            self.vault.data_dir,
+            path,
+            version=version,
+            sha256=sha256,
+            size=size,
+        )
+        launch_install(plan)
+        return plan
 
     def export_attachment(self, message_id: str, destination: str | Path) -> concurrent.futures.Future:
         return self._invoke("export_attachment", message_id, str(destination), scope="attachment")

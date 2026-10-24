@@ -115,6 +115,7 @@ class _ConnectionMixin:
             "name": profile.get("display_name", "我"),
             "listen_port": self.port,
             "addresses": addresses,
+            "version": self.version,
         }
 
     async def _send_hello_and_wait(self, session: EncryptedSession) -> dict[str, Any]:
@@ -486,6 +487,12 @@ class _ConnectionMixin:
             await self._handle_incoming_data_stream(session, contact, command)
         elif command_type == "friend_accept":
             await self._handle_friend_accept(session, contact, command)
+        elif command_type == "update_offer":
+            await self._handle_incoming_update_offer(session, contact, command)
+        elif command_type == "update_pull":
+            await self._handle_incoming_update_pull(session, contact, command)
+        elif command_type == "update_decline":
+            await self._handle_incoming_update_decline(session, contact, command)
         elif command_type == "ping":
             await session.send_control({"type": "pong"})
         else:

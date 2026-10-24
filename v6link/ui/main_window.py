@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import APP_NAME
+from .. import APP_NAME, __version__
 from ..netutil import format_endpoint
 from ..runtime import BackendRuntime
 from .dialogs import (
@@ -38,6 +38,7 @@ from .dialogs import (
     MyCardDialog,
     PendingRequestsDialog,
     SettingsDialog,
+    UpdateOfferDialog,
 )
 from .icons import icon, logo_pixmap
 from .theme import C
@@ -160,6 +161,7 @@ class MainWindow(QMainWindow):
         self.selected_id = ""
         self._file_offer_queue: list[dict[str, Any]] = []
         self._file_offer_dialog: FileOfferDialog | None = None
+        self._update_dialogs: dict[str, UpdateOfferDialog] = {}
         self.tray: TrayIcon | None = None
         self._tray_hint_shown = False
         self._restore_maximized = False
@@ -536,6 +538,33 @@ class MainWindow(QMainWindow):
                 message = event.get("message", "对方身份指纹校验失败")
                 self._toast(message, "error", duration=7000)
                 QApplication.alert(self, 3000)
+            elif event_type == "update_offer_received":
+                self._on_update_offer_received(event.get("offer") or {})
+            elif event_type == "update_progress":
+                dialog = self._update_dialogs.get(str(event.get("offer_id", "")))
+                if dialog is not None:
+                    dialog.set_progress(event)
+            elif event_type == "update_downloaded":
+                self._on_update_downloaded(event)
+            elif event_type == "update_failed":
+                self._on_update_failed(event)
+            elif event_type == "update_canceled":
+                dialog = self._update_dialogs.get(str(event.get("offer_id", "")))
+                if dialog is not None:
+                    dialog.mark_failed("已取消本次更新")
+            elif event_type == "update_invited":
+                name = str(event.get("contact_name", "好友"))
+                self._toast(
+                    f"已向 {name} 推送 {event.get('version', __version__)} 更新，等待对方确认",
+                    "info",
+                    duration=4200,
+                )
+            elif event_type == "update_declined":
+                name = str(event.get("contact_name", "好友"))
+                self._toast(f"{name} 没有接收本次版本更新", "info", duration=3600)
+            elif event_type == "update_pushed":
+                name = str(event.get("contact_name", "好友"))
+                self._toast(f"{name} 已完成更新包接收", "success", duration=4200)
             elif event_type == "attachment_open":
                 path = event.get("path", "")
                 if path and event.get("opened"):
@@ -594,6 +623,103 @@ class MainWindow(QMainWindow):
             self._file_offer_dialog = None
             dialog.force_close(str(event.get("reason", "")))
             QTimer.singleShot(0, self._show_next_file_offer)
+
+    # --------------------------------------------------------- version updates
+
+    def _push_update(self, contact_id: str) -> None:
+        contact = self.contacts.get(contact_id) or self.runtime.vault.get_contact(contact_id)
+        if not contact:
+            self._toast("联系人不存在", "error")
+            return
+        name = str(contact.get("name", "好友"))
+        box = QMessageBox(self)
+        box.setWindowTitle("推送版本更新")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"把本机 V6Link {__version__} 推送给「{name}」？")
+        box.setInformativeText(
+            "只有对方版本更旧时才会收到邀请。更新包通过端到端加密通道直接传输，"
+            "并用你的身份密钥签名；对方确认、下载并完成校验后，可自行选择重启安装。"
+        )
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.button(QMessageBox.Yes).setText("推送")
+        box.button(QMessageBox.No).setText("取消")
+        box.setDefaultButton(QMessageBox.Yes)
+        if box.exec() != QMessageBox.Yes:
+            return
+        try:
+            self.runtime.push_update(contact_id)
+        except Exception as exc:
+            self._toast(str(exc), "error")
+            return
+        self._toast("正在准备更新包，请稍候…", "info", duration=2800)
+
+    def _on_update_offer_received(self, offer: dict[str, Any]) -> None:
+        offer_id = str(offer.get("offer_id", ""))
+        if not offer_id or offer_id in self._update_dialogs:
+            return
+        name = str(offer.get("contact_name", "好友"))
+        version = str(offer.get("version", ""))
+        self._toast(f"{name} 想推送 V6Link {version} 更新", "info", duration=4200)
+        if not self.isActiveWindow():
+            QApplication.alert(self, 2500)
+            self._notify_tray(APP_NAME, f"{name} 想推送 V6Link {version} 更新")
+        dialog = UpdateOfferDialog(self.runtime, offer, self)
+        self._update_dialogs[offer_id] = dialog
+        dialog.install_requested.connect(self._on_update_install_requested)
+        dialog.finished.connect(
+            lambda _result, current=offer_id: self._update_dialogs.pop(current, None)
+        )
+        dialog.open()
+
+    def _on_update_downloaded(self, event: dict[str, Any]) -> None:
+        dialog = self._update_dialogs.get(str(event.get("offer_id", "")))
+        if dialog is not None:
+            dialog.mark_downloaded(event)
+            return
+        name = str(event.get("contact_name", "好友"))
+        self._toast(
+            f"已接收 {name} 推送的 {event.get('version', '')} 更新，可在好友菜单重新接收",
+            "success",
+            duration=5200,
+        )
+
+    def _on_update_failed(self, event: dict[str, Any]) -> None:
+        message = str(event.get("message", "更新失败"))
+        dialog = self._update_dialogs.get(str(event.get("offer_id", "")))
+        if dialog is not None:
+            dialog.mark_failed(message)
+            return
+        self._toast(f"版本更新失败：{message}", "error", duration=5600)
+
+    def _on_update_install_requested(self, payload: dict[str, Any]) -> None:
+        try:
+            self.runtime.install_update(
+                str(payload.get("path", "")),
+                version=str(payload.get("version", "")),
+                sha256=str(payload.get("sha256", "")),
+                size=int(payload.get("size", 0) or 0),
+            )
+        except Exception as exc:
+            self._toast(str(exc), "error", duration=7000)
+            dialog = self._update_dialogs.get(str(payload.get("offer_id", "")))
+            if dialog is not None:
+                dialog.mark_failed(str(exc))
+            return
+        for dialog in list(self._update_dialogs.values()):
+            with contextlib.suppress(Exception):
+                dialog.done(0)
+        self._update_dialogs.clear()
+        self._toast(
+            f"正在重启并更新到 {payload.get('version', '')}，请稍候…",
+            "success",
+            duration=3000,
+        )
+        QTimer.singleShot(300, self._restart_for_update)
+
+    def _restart_for_update(self) -> None:
+        log.info("restarting for a peer-pushed version update")
+        self._shutdown()
+        QApplication.quit()
 
     def _on_message_new(self, message: dict[str, Any]) -> None:
         if not message:
@@ -712,6 +838,7 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         edit_action = menu.addAction(icon("edit", C.TEXT_SOFT, 15), "编辑好友与地址")
+        update_action = menu.addAction(icon("arrow_down", C.ACCENT, 15), "推送版本更新…")
         if contact.get("peer_id"):
             verify_text = "取消已验证标记" if contact.get("verified") else "标记身份指纹为已验证"
             verify_action = menu.addAction(icon("shield", C.ACCENT, 15), verify_text)
@@ -729,6 +856,8 @@ class MainWindow(QMainWindow):
             return
         if chosen == edit_action:
             self._open_contact_edit(contact_id)
+        elif chosen == update_action:
+            self._push_update(contact_id)
         elif verify_action is not None and chosen == verify_action:
             verified = not bool(contact.get("verified"))
             try:

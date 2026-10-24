@@ -1,4 +1,4 @@
-﻿"""Modal flows: add/edit contact, request inbox, settings and identity card."""
+"""Modal flows: add/edit contact, request inbox, settings and identity card."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -25,12 +26,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..netutil import (
     format_endpoint,
     human_size,
-    shareable_ipv6_addresses,
     normalize_ipv6_host,
     parse_endpoint,
+    shareable_ipv6_addresses,
 )
 from .icons import icon
 from .theme import C
@@ -720,6 +722,9 @@ class SettingsDialog(BaseDialog):
         path_text.setWordWrap(True)
         path_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
         security_layout.addWidget(path_text)
+        self.version_text = QLabel(f"当前版本  V6Link {__version__}")
+        self.version_text.setStyleSheet("font-size: 10px; color: #6D8594;")
+        security_layout.addWidget(self.version_text)
         root.addWidget(security_section)
         root.addStretch(1)
         root.addWidget(self.error_label)
@@ -1218,4 +1223,229 @@ class FileOfferDialog(BaseDialog):
     def force_close(self, reason: str = "") -> None:
         self._decided = True
         self.timer.stop()
+        super().reject()
+
+
+class UpdateOfferDialog(BaseDialog):
+    """Confirm, track and finish a program update offered by a contact.
+
+    The dialog owns four states: ``offer`` (ask), ``downloading`` (pull with
+    progress), ``ready`` (verified and staged) and ``error``. It never installs
+    anything by itself; the main window performs the swap after the user picks
+    "立即重启并更新".
+    """
+
+    install_requested = Signal(dict)
+
+    def __init__(self, runtime, offer: dict[str, Any], parent: QWidget | None = None):
+        super().__init__("版本更新邀请", parent, width=560)
+        self.runtime = runtime
+        self.offer = dict(offer)
+        self.offer_id = str(self.offer.get("offer_id", ""))
+        self._stage = "offer"
+        self._installable = False
+        self._ready_info: dict[str, Any] = {}
+        self.setMinimumHeight(380)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 22, 24, 20)
+        root.setSpacing(14)
+
+        contact_name = str(self.offer.get("contact_name", "好友"))
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(12)
+        avatar = Avatar(contact_name, str(self.offer.get("contact_id", "")), 42)
+        top.addWidget(avatar, 0, Qt.AlignTop)
+        heading = QVBoxLayout()
+        heading.setContentsMargins(0, 0, 0, 0)
+        heading.setSpacing(3)
+        self.headline = QLabel(f"{contact_name} 想推送新版本")
+        self.headline.setStyleSheet("font-size: 16px; font-weight: 700; color: #ECF4F8;")
+        self.subtitle = QLabel("更新包使用对方的身份密钥签名，接收后还会再次校验")
+        self.subtitle.setStyleSheet("font-size: 10px; color: #7890A2;")
+        heading.addWidget(self.headline)
+        heading.addWidget(self.subtitle)
+        top.addLayout(heading, 1)
+        root.addLayout(top)
+        root.addWidget(hline())
+
+        version_frame = QFrame()
+        version_frame.setObjectName("settingsSection")
+        version_layout = QHBoxLayout(version_frame)
+        version_layout.setContentsMargins(14, 13, 14, 13)
+        version_layout.setSpacing(11)
+        update_icon = QLabel()
+        update_icon.setPixmap(icon("shield", "#86DACA", 24).pixmap(QSize(24, 24)))
+        version_layout.addWidget(update_icon, 0, Qt.AlignTop)
+        version_text = QVBoxLayout()
+        version_text.setContentsMargins(0, 0, 0, 0)
+        version_text.setSpacing(3)
+        current = str(self.offer.get("current_version", ""))
+        target = str(self.offer.get("version", ""))
+        version_label = QLabel(f"{current or '当前版本'}  →  {target or '新版本'}")
+        version_label.setWordWrap(True)
+        version_label.setStyleSheet("font-size: 13px; font-weight: 600; color: #E6F0F5;")
+        size = int(self.offer.get("size", 0) or 0)
+        digest = str(self.offer.get("sha256", ""))
+        details = f"{human_size(size)} · SHA-256 {digest[:16]}…"
+        details_label = QLabel(details)
+        details_label.setStyleSheet("font-size: 10px; color: #7890A2;")
+        version_text.addWidget(version_label)
+        version_text.addWidget(details_label)
+        version_layout.addLayout(version_text, 1)
+        root.addWidget(version_frame)
+
+        notes = str(self.offer.get("notes", "") or "").strip()
+        if notes:
+            notes_label = QLabel(notes)
+            notes_label.setWordWrap(True)
+            notes_label.setStyleSheet(
+                "font-size: 10px; color: #9FB4C2; background: #111C25;"
+                " border-radius: 6px; padding: 8px;"
+            )
+            root.addWidget(notes_label)
+
+        self.hint = QLabel(
+            "接收只是把更新包下载到本机并校验，不会立即替换程序；"
+            "下载完成后会再询问一次是否重启完成更新。"
+        )
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("font-size: 10px; color: #6D8594;")
+        root.addWidget(self.hint)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1000)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(6)
+        self.progress.hide()
+        root.addWidget(self.progress)
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet("font-size: 10px; color: #8FA8B8;")
+        self.progress_label.hide()
+        root.addWidget(self.progress_label)
+
+        root.addStretch(1)
+        root.addWidget(self.error_label)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(9)
+        buttons.addStretch(1)
+        self.later_button = QPushButton("稍后再说")
+        self.later_button.setCursor(Qt.PointingHandCursor)
+        self.later_button.clicked.connect(self.reject)
+        buttons.addWidget(self.later_button)
+        self.close_button = QPushButton("稍后重启")
+        self.close_button.setCursor(Qt.PointingHandCursor)
+        self.close_button.clicked.connect(self.reject)
+        self.close_button.hide()
+        buttons.addWidget(self.close_button)
+        self.install_button = QPushButton("立即重启并更新")
+        self.install_button.setObjectName("primaryButton")
+        self.install_button.setCursor(Qt.PointingHandCursor)
+        self.install_button.clicked.connect(self._install)
+        self.install_button.hide()
+        buttons.addWidget(self.install_button)
+        self.accept_button = QPushButton("接收并更新")
+        self.accept_button.setObjectName("primaryButton")
+        self.accept_button.setCursor(Qt.PointingHandCursor)
+        self.accept_button.clicked.connect(self._accept)
+        buttons.addWidget(self.accept_button)
+        root.addLayout(buttons)
+        self._sync_buttons()
+
+    # ------------------------------------------------------------------ states
+
+    def _sync_buttons(self) -> None:
+        stage = self._stage
+        self.later_button.setVisible(stage in ("offer", "downloading"))
+        self.later_button.setText("取消接收" if stage == "downloading" else "稍后再说")
+        self.accept_button.setVisible(stage == "offer")
+        self.accept_button.setEnabled(stage == "offer")
+        self.install_button.setVisible(stage == "ready" and self._installable)
+        self.close_button.setVisible(stage in ("ready", "error"))
+
+    def _accept(self) -> None:
+        if self._stage != "offer":
+            return
+        try:
+            self.runtime.respond_update_offer(self.offer_id, True)
+        except Exception as exc:
+            self.show_error(str(exc))
+            return
+        self.clear_error()
+        self._stage = "downloading"
+        self.headline.setText("正在接收更新包")
+        self.subtitle.setText("加密通道直连，接收完成后自动校验签名与 SHA-256")
+        self.hint.setText("传输期间可以继续使用其他功能；取消会删除已接收的部分。")
+        self.progress.setValue(0)
+        self.progress.show()
+        self.progress_label.setText("准备接收…")
+        self.progress_label.show()
+        self._sync_buttons()
+
+    def _install(self) -> None:
+        if self._stage != "ready" or not self._ready_info:
+            return
+        self.install_requested.emit(dict(self._ready_info))
+
+    def set_progress(self, event: dict[str, Any]) -> None:
+        if self._stage != "downloading":
+            return
+        percent = float(event.get("percent", 0.0) or 0.0)
+        transferred = int(event.get("transferred", 0) or 0)
+        total = int(event.get("total", 0) or 0)
+        speed = float(event.get("speed", 0.0) or 0.0)
+        self.progress.setValue(max(0, min(1000, int(percent * 10))))
+        self.progress_label.setText(
+            f"{percent:.1f}% · {human_size(transferred)} / {human_size(total)}"
+            f" · {human_size(int(speed))}/s"
+        )
+
+    def mark_downloaded(self, payload: dict[str, Any]) -> None:
+        self._ready_info = dict(payload)
+        self._installable = bool(payload.get("installable"))
+        self._stage = "ready"
+        self.clear_error()
+        self.progress.setValue(1000)
+        self.progress.show()
+        self.progress_label.show()
+        self.progress_label.setText("已下载并通过签名与 SHA-256 校验")
+        self.headline.setText("更新包已就绪")
+        self.subtitle.setText("已保存到本地，等待你确认重启")
+        if self._installable:
+            self.hint.setText(
+                "点击「立即重启并更新」会退出当前程序，自动备份旧版本、替换为新版本并重新启动。"
+            )
+        else:
+            path = str(payload.get("path", ""))
+            self.hint.setText(
+                "当前以源码方式运行，程序不会自动替换。更新包已保存到：\n" + path
+            )
+        self._sync_buttons()
+
+    def mark_failed(self, message: str) -> None:
+        self._stage = "error"
+        self.progress.hide()
+        self.progress_label.hide()
+        self.headline.setText("更新接收失败")
+        self.subtitle.setText(str(self.offer.get("contact_name", "好友")))
+        self.show_error(message or "未知原因")
+        self._sync_buttons()
+
+    def reject(self) -> None:
+        if self._stage == "downloading":
+            with contextlib.suppress(Exception):
+                self.runtime.cancel_update(self.offer_id)
+            self._stage = "error"
+            self.progress.hide()
+            self.progress_label.hide()
+            self.headline.setText("已取消接收")
+            self.show_error("已取消本次更新，已接收的部分已删除")
+            self._sync_buttons()
+            return
+        if self._stage == "offer":
+            with contextlib.suppress(Exception):
+                self.runtime.respond_update_offer(self.offer_id, False)
         super().reject()
