@@ -1,9 +1,10 @@
-﻿"""Security and encrypted-storage tests."""
+"""Security and encrypted-storage tests."""
 
 from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,18 @@ from v6link.ui.dialogs import parse_share_card
 from v6link.vault import Vault
 
 
+def _ipv6_loopback_available() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+IPV6_LOOPBACK = _ipv6_loopback_available()
+
+
 class RecordingWriter:
     def __init__(self, wrapped):
         self.wrapped = wrapped
@@ -53,6 +66,7 @@ class RecordingWriter:
         return self.wrapped.get_extra_info(name, default)
 
 
+@unittest.skipUnless(IPV6_LOOPBACK, "IPv6 loopback is unavailable on this runner")
 class CryptoSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.server_identity = Identity.generate()

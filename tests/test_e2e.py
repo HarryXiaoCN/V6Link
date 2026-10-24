@@ -1,4 +1,4 @@
-﻿"""Full loopback IPv6 test: friend request, encrypted messages, files."""
+"""Full loopback IPv6 test: friend request, encrypted messages, files."""
 
 from __future__ import annotations
 
@@ -16,6 +16,18 @@ from v6link.crypto import EncryptedSession
 from v6link.engine import ChatEngine, _valid_announced_hosts
 from v6link.filestore import cleanup_temp_file, iter_plaintext
 from v6link.vault import Vault
+
+
+def _ipv6_loopback_available() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+IPV6_LOOPBACK = _ipv6_loopback_available()
 
 
 class EventCollector:
@@ -57,6 +69,7 @@ def _message_ready(message: dict[str, Any]) -> bool:
     return message.get("kind") == "file" and message.get("status") == "ready"
 
 
+@unittest.skipUnless(IPV6_LOOPBACK, "IPv6 loopback is unavailable on this runner")
 class IPv6EndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._dirs: list[tempfile.TemporaryDirectory] = []

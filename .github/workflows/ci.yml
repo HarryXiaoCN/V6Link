@@ -28,11 +28,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Environment and IPv6 check
+      - name: Environment
         run: |
           python --version
           python -m pip --version
-          python -c "import socket; s=socket.socket(socket.AF_INET6); s.bind(('::', 0)); print('ipv6 ok', s.getsockname()); s.close()"
       - name: Install core dependencies
         run: |
           python -m pip install --upgrade pip

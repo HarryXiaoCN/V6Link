@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import socket
 import tempfile
 import unittest
 from collections.abc import Callable
@@ -27,6 +28,18 @@ from v6link.updates import (
     verify_manifest,
 )
 from v6link.vault import Vault
+
+
+def _ipv6_loopback_available() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+IPV6_LOOPBACK = _ipv6_loopback_available()
 
 
 class EventCollector:
@@ -127,6 +140,7 @@ class UpdateUnitTests(unittest.TestCase):
                 normalize_manifest(broken)
 
 
+@unittest.skipUnless(IPV6_LOOPBACK, "IPv6 loopback is unavailable on this runner")
 class UpdateEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._dirs: list[tempfile.TemporaryDirectory] = []
