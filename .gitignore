@@ -1,0 +1,29 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# App-local runtime data (should never be committed)
+.v6link-data/
+*.v6
+vault.key
+attachments/
+
+# Local capture artifacts
+ui-smoke.png
+welcome-test.png
+button-req.png
+dialog-requests*.png
+port-row-test.png
+screenshots/dialog-*.png
+screenshots/live-chat.png
+screenshots/friend-request-flow.png
+screenshots/listener-error.png
+demo-*/
+
