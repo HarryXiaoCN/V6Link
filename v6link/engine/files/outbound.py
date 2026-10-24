@@ -5,19 +5,24 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..crypto import (
+from ...crypto import (
     EncryptedSession,
 )
-from ..errors import (
+from ...errors import (
     PeerApprovalRequired,
     TransferError,
 )
-from ..filestore import DEFAULT_CHUNK
+from ...filestore import DEFAULT_CHUNK
+from ...vault import Vault
 
-from .models import (
+from ..connections import ConnectionManager
+from ..contacts import ContactService
+from ..events import EventBus
+from ..models import (
     ACK_TIMEOUT,
     FILE_OFFER_TIMEOUT,
     FILE_RESULT_TIMEOUT,
@@ -36,13 +41,36 @@ from .models import (
     _read_range,
     _friendly_error,
 )
+from ..tasks import TaskRegistry
+from .state import FileState
+
+WaitingRetry = Callable[[str], None]
 
 
-class _OutboundFileMixin:
-    """Outgoing file transfers and cancellation."""
+class OutboundTransferService:
+    """Sends files over parallel encrypted sessions."""
+
+    def __init__(
+        self,
+        *,
+        vault: Vault,
+        events: EventBus,
+        tasks: TaskRegistry,
+        contacts: ContactService,
+        connections: ConnectionManager,
+        state: FileState,
+        schedule_waiting_retry: WaitingRetry,
+    ):
+        self.vault = vault
+        self.events = events
+        self.tasks = tasks
+        self.contacts = contacts
+        self.connections = connections
+        self.state = state
+        self.schedule_waiting_retry = schedule_waiting_retry
 
     async def send_file(self, contact_id: str, file_path: str | Path) -> str:
-        contact = self._require_contact(contact_id)
+        contact = self.contacts.require_contact(contact_id)
         if contact.get("blocked"):
             raise ValueError("该好友已被拉黑")
         source = Path(file_path).expanduser()
@@ -62,25 +90,28 @@ class _OutboundFileMixin:
             "storage": "external",
         }
         message = self.vault.add_file_message(contact_id, "out", file_meta, "sending")
-        self._emit("message_new", message=message)
+        self.events.emit("message_new", message=message)
         record = _OutboundFile(message_id=message["id"])
-        self._outbound_files[message["id"]] = record
+        self.state.outbound_files[message["id"]] = record
         try:
-            task = self._spawn(self._deliver_file(message, record), name=f"file-{message['id'][:8]}")
+            task = self.tasks.spawn(
+                self.deliver_file(message, record),
+                name=f"file-{message['id'][:8]}",
+            )
         except Exception:
-            self._outbound_files.pop(message["id"], None)
+            self.state.outbound_files.pop(message["id"], None)
             raise
         record.task = task
         return message["id"]
 
-    async def _deliver_file(self, message: dict[str, Any], record: _OutboundFile) -> None:
+    async def deliver_file(self, message: dict[str, Any], record: _OutboundFile) -> None:
         control: EncryptedSession | None = None
         channel: _FileControlChannel | None = None
         worker_tasks: list[asyncio.Task] = []
         message_id = message["id"]
         try:
-            contact = self._require_contact(message["contact_id"])
-            lock = self._file_locks.setdefault(contact["id"], asyncio.Lock())
+            contact = self.contacts.require_contact(message["contact_id"])
+            lock = self.state.file_locks.setdefault(contact["id"], asyncio.Lock())
             async with lock:
                 file_meta = message.get("file") or {}
                 source = Path(str(file_meta.get("source_path", "")))
@@ -124,16 +155,16 @@ class _OutboundFileMixin:
                         "source_path": str(source.resolve()),
                     },
                 )
-                self._emit("message_updated", message=updated)
+                self.events.emit("message_updated", message=updated)
                 progress = ProgressEmitter(
-                    self._event_sink,
+                    self.events.sink,
                     contact["id"],
                     message_id,
                     "out",
                     size,
                 )
 
-                control, _reply = await self._open_peer_connection(contact)
+                control, _reply = await self.connections.open_peer_connection(contact)
                 record.control = control
                 channel = _FileControlChannel(control, f"out-{file_id[:8]}")
                 record.channel = channel
@@ -148,7 +179,7 @@ class _OutboundFileMixin:
                         "fingerprint": fingerprint,
                     },
                 )
-                self._emit("message_updated", message=updated)
+                self.events.emit("message_updated", message=updated)
                 await control.send_control(
                     {
                         "type": "file_offer",
@@ -173,7 +204,7 @@ class _OutboundFileMixin:
                             file_update={"completed_at": _now()},
                         )
                         progress.finish()
-                        self._emit("message_updated", message=updated)
+                        self.events.emit("message_updated", message=updated)
                         return
                     if error == "transfer_canceled":
                         updated = self.vault.update_message(
@@ -181,7 +212,7 @@ class _OutboundFileMixin:
                             status="canceled",
                             error="对方已取消过该文件传输，文件不会保留",
                         )
-                        self._emit("message_updated", message=updated)
+                        self.events.emit("message_updated", message=updated)
                         return
                     reason = {
                         "declined": "对方拒绝接收文件",
@@ -191,7 +222,7 @@ class _OutboundFileMixin:
                         "chunk_size_mismatch": "对方保存的续传分块参数不一致",
                     }.get(error, f"对方拒绝接收文件：{error}")
                     updated = self.vault.update_message(message_id, status="declined", error=reason)
-                    self._emit("message_updated", message=updated)
+                    self.events.emit("message_updated", message=updated)
                     return
                 if reply_type == "file_cancel":
                     updated = self.vault.update_message(
@@ -199,7 +230,7 @@ class _OutboundFileMixin:
                         status="canceled",
                         error=str(reply.get("error") or "对方取消了文件传输"),
                     )
-                    self._emit("message_updated", message=updated)
+                    self.events.emit("message_updated", message=updated)
                     return
                 if reply_type != "file_accept":
                     raise _PermanentFileError("对方没有返回有效的文件接收确认")
@@ -229,10 +260,9 @@ class _OutboundFileMixin:
                         "received_bytes": int(received_bytes),
                     },
                 )
-                self._emit("message_updated", message=updated)
+                self.events.emit("message_updated", message=updated)
                 progress.update(received_bytes, force=True)
                 sent_bytes = received_bytes
-
                 if missing:
                     missing_queue: asyncio.Queue[int] = asyncio.Queue()
                     for index in missing:
@@ -243,7 +273,7 @@ class _OutboundFileMixin:
                         data_session: EncryptedSession | None = None
                         handle = None
                         try:
-                            data_session, _ = await self._open_peer_connection(contact)
+                            data_session, _ = await self.connections.open_peer_connection(contact)
                             await data_session.send_control(
                                 {"type": "stream_open", "file_id": file_id}
                             )
@@ -278,7 +308,7 @@ class _OutboundFileMixin:
                             if handle is not None:
                                 with contextlib.suppress(Exception):
                                     await asyncio.to_thread(handle.close)
-                            await self._close_session(data_session)
+                            await self.connections.close_session(data_session)
 
                     worker_tasks = [
                         asyncio.create_task(worker(index), name=f"file-worker-{index}")
@@ -313,7 +343,7 @@ class _OutboundFileMixin:
                             status="canceled",
                             error=channel.cancel_reason or "接收方取消了文件传输，文件不会保留",
                         )
-                        self._emit("message_updated", message=updated)
+                        self.events.emit("message_updated", message=updated)
                         return
                     errors: list[BaseException] = []
                     for task in done:
@@ -345,7 +375,7 @@ class _OutboundFileMixin:
                                 status="canceled",
                                 error=str(inbound.get("error") or "接收方取消了文件传输"),
                             )
-                            self._emit("message_updated", message=updated)
+                            self.events.emit("message_updated", message=updated)
                             return
                         if inbound_type == "ping":
                             await control.send_control({"type": "pong"})
@@ -366,7 +396,7 @@ class _OutboundFileMixin:
                     },
                 )
                 progress.finish()
-                self._emit("message_updated", message=updated)
+                self.events.emit("message_updated", message=updated)
         except PeerApprovalRequired:
             try:
                 updated = self.vault.update_message(
@@ -374,9 +404,9 @@ class _OutboundFileMixin:
                     status="waiting",
                     error="好友请求已发送，等待对方接受",
                 )
-                self._emit("message_updated", message=updated)
-                self._schedule_waiting_retry(message["contact_id"])
-                self._emit(
+                self.events.emit("message_updated", message=updated)
+                self.schedule_waiting_retry(message["contact_id"])
+                self.events.emit(
                     "toast",
                     message="对方还没有添加你，已发送好友请求。接受后可自动重试。",
                     level="info",
@@ -398,7 +428,7 @@ class _OutboundFileMixin:
                         status="paused",
                         error="传输已暂停，可继续",
                     )
-                    self._emit("message_updated", message=updated)
+                    self.events.emit("message_updated", message=updated)
             except Exception:
                 log.debug("failed to mark file paused on cancel", exc_info=True)
             raise
@@ -425,7 +455,7 @@ class _OutboundFileMixin:
                     status=status,
                     error=reason if status != "paused" else f"{reason}，可继续传输",
                 )
-                self._emit("message_updated", message=updated)
+                self.events.emit("message_updated", message=updated)
             except Exception:
                 log.debug("failed to mark outgoing file paused", exc_info=True)
         finally:
@@ -435,74 +465,46 @@ class _OutboundFileMixin:
             if worker_tasks:
                 with contextlib.suppress(BaseException):
                     await asyncio.gather(*worker_tasks, return_exceptions=True)
-            if self._outbound_files.get(message_id) is record:
-                self._outbound_files.pop(message_id, None)
+            if self.state.outbound_files.get(message_id) is record:
+                self.state.outbound_files.pop(message_id, None)
             if channel is not None:
                 with contextlib.suppress(BaseException):
                     await channel.close()
             elif control is not None:
                 with contextlib.suppress(BaseException):
-                    await self._close_session(control)
+                    await self.connections.close_session(control)
 
-    async def cancel_transfer(self, message_id: str) -> None:
-        """Explicitly cancel: the receiver must delete its partial container."""
+    async def retry_file(self, message_id: str) -> None:
         message = self.vault.get_message(message_id)
         if message is None:
             raise ValueError("消息不存在")
+        if message.get("direction") != "out":
+            raise ValueError("只能重试已发送的消息")
+        existing_record = self.state.outbound_files.get(message_id)
+        if (
+            existing_record is not None
+            and existing_record.task is not None
+            and not existing_record.task.done()
+        ):
+            raise ValueError("该消息正在发送中")
         if message.get("kind") != "file":
-            raise ValueError("只有文件传输可以取消")
-        if message.get("direction") == "out":
-            if message.get("status") not in ("sending", "awaiting_consent", "transferring"):
-                raise ValueError("该文件当前没有正在进行的传输")
-            record = self._outbound_files.get(message_id)
-            updated = self.vault.update_message(
-                message_id,
-                status="canceled",
-                error="已取消传输，文件不会保留",
-                file_update={"canceled_at": _now()},
-            )
-            self._emit("message_updated", message=updated)
-            if record is not None and record.channel is not None:
-                with contextlib.suppress(Exception):
-                    async with asyncio.timeout(2.0):
-                        await record.channel.session.send_control(
-                            {
-                                "type": "file_cancel",
-                                "file_id": record.file_id,
-                                "error": "已取消发送，文件不会保留",
-                            }
-                        )
-            if record is not None and record.task is not None and not record.task.done():
-                record.task.cancel()
-            return
-
-        if message.get("status") != "receiving":
-            raise ValueError("该文件当前没有正在接收")
-        transfer = next(
-            (
-                item
-                for item in self._active_inbound.values()
-                if item.message_id == message_id
-            ),
-            None,
-        )
-        if transfer is not None:
-            await self._cancel_inbound(
-                transfer,
-                "已取消接收，文件不会保留",
-                notify_peer=True,
-            )
-            return
+            raise ValueError("该消息不是文件消息")
+        if message.get("status") not in ("failed", "waiting", "paused", "declined"):
+            raise ValueError("该文件当前不能继续传输")
         file_meta = message.get("file") or {}
-        relative = file_meta.get("enc_path")
-        if relative:
-            with contextlib.suppress(Exception):
-                path = self.vault.attachment_path(relative)
-                await asyncio.to_thread(path.unlink, missing_ok=True)
-        updated = self.vault.update_message(
-            message_id,
-            status="canceled",
-            error="已取消接收，文件不会保留",
-            file_update={"canceled_at": _now()},
-        )
-        self._emit("message_updated", message=updated)
+        source = Path(str(file_meta.get("source_path", "")))
+        if not source.is_file():
+            raise ValueError("源文件已不存在，无法继续")
+        updated = self.vault.update_message(message_id, status="sending", error="")
+        self.events.emit("message_updated", message=updated)
+        record = _OutboundFile(message_id=message_id)
+        self.state.outbound_files[message_id] = record
+        try:
+            task = self.tasks.spawn(
+                self.deliver_file(updated, record),
+                name=f"retry-file-{message_id[:8]}",
+            )
+        except Exception:
+            self.state.outbound_files.pop(message_id, None)
+            raise
+        record.task = task

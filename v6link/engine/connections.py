@@ -1,11 +1,11 @@
-"""Outgoing and incoming encrypted connections, peer matching and hello exchange."""
+"""Encrypted IPv6 connections, handshake and incoming command dispatch."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import ipaddress
-import socket
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..crypto import (
@@ -25,86 +25,118 @@ from ..netutil import (
     shareable_ipv6_addresses,
 )
 
+from .contacts import ContactService
+from .events import EventBus
 from .models import (
     APP_WIRE_NAME,
     PROTOCOL,
-    CONNECT_TIMEOUT,
     CONTROL_TIMEOUT,
     log,
     _clean_peer_name,
     _valid_announced_hosts,
     _validate_port,
 )
+from .tasks import TaskRegistry
+from .transport import Transport
+
+CommandHandler = Callable[[EncryptedSession, dict[str, Any]], Awaitable[None]]
 
 
-class _ConnectionMixin:
-    """Outgoing and incoming encrypted connections, peer matching and hello exchange."""
+class ConnectionManager:
+    """Owns the listener, live sessions and peer handshakes."""
 
-    @staticmethod
-    def _configure_socket(writer: asyncio.StreamWriter) -> None:
-        sock = writer.get_extra_info("socket")
-        if sock is None:
-            return
-        with contextlib.suppress(OSError, AttributeError):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        with contextlib.suppress(OSError, AttributeError):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        if hasattr(socket, "TCP_KEEPIDLE"):
-            with contextlib.suppress(OSError):
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-        if hasattr(socket, "TCP_KEEPINTVL"):
-            with contextlib.suppress(OSError):
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-        if hasattr(socket, "TCP_KEEPCNT"):
-            with contextlib.suppress(OSError):
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    def __init__(
+        self,
+        *,
+        vault: Any,
+        identity: Any,
+        version: str,
+        bind_host: str,
+        events: EventBus,
+        tasks: TaskRegistry,
+        transport: Transport,
+        contacts: ContactService,
+        port: int = 0,
+        command_handler: CommandHandler | None = None,
+    ):
+        self.vault = vault
+        self.identity = identity
+        self.version = version
+        self.bind_host = bind_host
+        self.events = events
+        self.tasks = tasks
+        self.transport = transport
+        self.contacts = contacts
+        self.port = int(port)
+        self.command_handler = command_handler
+        self._server: asyncio.AbstractServer | None = None
+        self.sessions: set[EncryptedSession] = set()
+        self.started = False
 
-    async def _connect(self, host: str, port: int) -> EncryptedSession:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, family=socket.AF_INET6),
-            timeout=CONNECT_TIMEOUT,
-        )
+    @property
+    def listening(self) -> bool:
+        return self._server is not None
+
+    async def start_listener(self, port: int) -> None:
+        server = await self.transport.listen(self.bind_host, port, self.handle_incoming_connection)
+        self._server = server
+        self.port = int(server.sockets[0].getsockname()[1])
+        self.started = True
+
+    async def stop_listener(self) -> None:
+        server = self._server
+        self._server = None
+        if server is not None:
+            await self.transport.close_server(server)
+        self.started = False
+
+    async def restart_listener(self, new_port: int, old_port: int) -> int:
+        server = self._server
+        self._server = None
+        if server is not None:
+            await self.transport.close_server(server)
         try:
-            self._configure_socket(writer)
+            await self.start_listener(new_port)
+            return self.port
+        except OSError as exc:
+            try:
+                await self.start_listener(old_port)
+                self.port = old_port
+            except OSError:
+                self._server = None
+            raise ValueError(f"无法监听新端口：{exc.strerror or exc}") from exc
+
+    async def close_all_sessions(self) -> None:
+        for session in list(self.sessions):
+            await session.close()
+        self.sessions.clear()
+
+    def get_network_snapshot(self) -> dict[str, Any]:
+        return {
+            "listening": self.started and self._server is not None,
+            "port": self.port,
+            "host": self.bind_host,
+        }
+
+    async def client_connect(self, host: str, port: int) -> EncryptedSession:
+        reader, writer = await self.transport.open(host, port)
+        try:
             session = await client_handshake(reader, writer, self.identity)
         except BaseException:
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
             raise
-        self._sessions.add(session)
+        self.sessions.add(session)
         return session
 
-    async def _close_session(self, session: EncryptedSession | None) -> None:
+    async def close_session(self, session: EncryptedSession | None) -> None:
         if session is None:
             return
-        self._sessions.discard(session)
+        self.sessions.discard(session)
         await session.close()
 
-    @staticmethod
-    def _source_address(writer: asyncio.StreamWriter) -> tuple[str, int]:
-        peer = writer.get_extra_info("peername")
-        if not isinstance(peer, tuple) or len(peer) < 2:
-            return "", 0
-        raw_host = str(peer[0])
-        source_port = int(peer[1])
-        try:
-            parsed = ipaddress.IPv6Address(raw_host.split("%", 1)[0])
-            if parsed.is_link_local and "%" not in raw_host and len(peer) >= 4 and peer[3]:
-                raw_host = f"{raw_host}%{peer[3]}"
-        except ValueError:
-            pass
-        return raw_host, source_port
-
-    @staticmethod
-    def _hello_payload() -> dict[str, Any]:
-        return {
-            "type": "hello",
-            "app": APP_WIRE_NAME,
-            "protocol": PROTOCOL,
-        }
-
-    def _local_profile_payload(self) -> dict[str, Any]:
+    def local_profile_payload(self) -> dict[str, Any]:
         profile = self.vault.profile()
         addresses: list[str] = []
         try:
@@ -118,9 +150,17 @@ class _ConnectionMixin:
             "version": self.version,
         }
 
-    async def _send_hello_and_wait(self, session: EncryptedSession) -> dict[str, Any]:
-        payload = self._hello_payload()
-        payload.update(self._local_profile_payload())
+    @staticmethod
+    def hello_payload() -> dict[str, Any]:
+        return {
+            "type": "hello",
+            "app": APP_WIRE_NAME,
+            "protocol": PROTOCOL,
+        }
+
+    async def send_hello_and_wait(self, session: EncryptedSession) -> dict[str, Any]:
+        payload = self.hello_payload()
+        payload.update(self.local_profile_payload())
         await session.send_control(payload)
         async with asyncio.timeout(CONTROL_TIMEOUT):
             reply = await session.receive_control()
@@ -129,7 +169,7 @@ class _ConnectionMixin:
         return reply
 
     @staticmethod
-    def _advertised_peer_port(reply: dict[str, Any]) -> int:
+    def advertised_peer_port(reply: dict[str, Any]) -> int:
         try:
             port = int(reply.get("listen_port", 0))
             if 1 <= port <= 65535:
@@ -138,7 +178,21 @@ class _ConnectionMixin:
             pass
         return 0
 
-    async def _open_peer_connection(self, contact: dict[str, Any]) -> tuple[EncryptedSession, dict[str, Any]]:
+    @staticmethod
+    def source_address(writer: asyncio.StreamWriter) -> tuple[str, int]:
+        peer = writer.get_extra_info("peername")
+        if not isinstance(peer, tuple) or len(peer) < 2:
+            return "", 0
+        raw_host = str(peer[0])
+        source_port = int(peer[1])
+        try:
+            parsed = ipaddress.IPv6Address(raw_host.split("%", 1)[0])
+            if parsed.is_link_local and "%" not in raw_host and len(peer) >= 4 and peer[3]:
+                raw_host = f"{raw_host}%{peer[3]}"
+        except ValueError:
+            pass
+        return raw_host, source_port
+    async def open_peer_connection(self, contact: dict[str, Any]) -> tuple[EncryptedSession, dict[str, Any]]:
         """Connect to the first working saved IPv6 endpoint and authenticate it."""
         addresses = list(contact.get("addresses") or [])
         if not addresses:
@@ -157,7 +211,7 @@ class _ConnectionMixin:
                 port = int(address.get("port", self.port))
                 if not 1 <= port <= 65535:
                     continue
-                session = await self._connect(host, port)
+                session = await self.client_connect(host, port)
             except (TimeoutError, OSError, HandshakeError, ValueError) as exc:
                 errors.append(f"{format_endpoint(host, port) if host else host}: {exc}")
                 continue
@@ -165,7 +219,7 @@ class _ConnectionMixin:
                 if session.peer_id == self.identity.peer_id:
                     # A card or a hand-edited contact may still point at
                     # ::1. Never display this as a peer identity change.
-                    await self._close_session(session)
+                    await self.close_session(session)
                     self_skipped += 1
                     errors.append(
                         f"{format_endpoint(host, port)}: 该地址指向本机自身，已跳过"
@@ -173,9 +227,9 @@ class _ConnectionMixin:
                     continue
                 if expected_peer_id and session.peer_id != expected_peer_id:
 
-                    await self._close_session(session)
+                    await self.close_session(session)
                     identity_conflict = True
-                    self._emit(
+                    self.events.emit(
                         "security_alert",
                         contact_id=contact.get("id", ""),
                         expected=expected_peer_id,
@@ -185,25 +239,25 @@ class _ConnectionMixin:
                     continue
                 try:
                     async with asyncio.timeout(CONTROL_TIMEOUT):
-                        reply = await self._send_hello_and_wait(session)
+                        reply = await self.send_hello_and_wait(session)
                 except Exception:
-                    await self._close_session(session)
+                    await self.close_session(session)
                     raise
                 accepted = bool(reply.get("accepted"))
                 learned_peer = session.peer_id
                 current_contact = self.vault.get_contact(contact["id"])
                 if current_contact is None:
-                    await self._close_session(session)
+                    await self.close_session(session)
                     raise PeerUnreachable("好友已被删除")
                 if not current_contact.get("peer_id"):
                     current_contact = self.vault.bind_peer_identity(contact["id"], learned_peer)
-                    self._emit_contact(current_contact, force=True)
+                    self.events.emit_contact(current_contact, force=True)
                 else:
                     expected = current_contact.get("peer_id")
                     if expected != learned_peer:
-                        await self._close_session(session)
+                        await self.close_session(session)
                         identity_conflict = True
-                        self._emit(
+                        self.events.emit(
                             "security_alert",
                             contact_id=contact.get("id", ""),
                             expected=expected,
@@ -213,7 +267,7 @@ class _ConnectionMixin:
                         continue
                 if not accepted:
                     reason = str(reply.get("reason", ""))
-                    await self._close_session(session)
+                    await self.close_session(session)
                     if reason == "contact_request":
                         raise PeerApprovalRequired(learned_peer)
                     if reason == "blocked":
@@ -229,7 +283,7 @@ class _ConnectionMixin:
                         source="manual",
                         success=True,
                     )
-                    advertised = self._advertised_peer_port(reply)
+                    advertised = self.advertised_peer_port(reply)
                     if advertised and (advertised != port):
                         updated = self.vault.add_or_touch_address(
                             contact["id"],
@@ -239,12 +293,12 @@ class _ConnectionMixin:
                             success=True,
                         )
                     announced_hosts = _valid_announced_hosts(reply.get("addresses"))
-                    updated = self._add_announced_addresses(
+                    updated = self.contacts.add_announced_addresses(
                         updated,
                         announced_hosts,
                         advertised or port,
                     )
-                    self._emit_contact(updated, force=True)
+                    self.events.emit_contact(updated, force=True)
                 except (ValueError, OSError) as exc:
                     log.debug("address book update failed: %s", exc)
                 return session, reply
@@ -253,7 +307,7 @@ class _ConnectionMixin:
             except PeerUnreachable:
                 raise
             except Exception as exc:
-                await self._close_session(session)
+                await self.close_session(session)
                 errors.append(str(exc))
                 continue
         if identity_conflict:
@@ -270,14 +324,7 @@ class _ConnectionMixin:
             detail += f"；已跳过 {self_skipped} 个指向本机的地址"
         raise PeerUnreachable(f"已尝试 {attempts} 个 IPv6 地址，仍无法建立加密连接（{detail}）", attempts)
 
-    def get_network_snapshot(self) -> dict[str, Any]:
-        return {
-            "listening": self._started and self._server is not None,
-            "port": self.port,
-            "host": self.bind_host,
-        }
-
-    async def _handle_incoming_connection(
+    async def handle_incoming_connection(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
@@ -285,11 +332,11 @@ class _ConnectionMixin:
         session: EncryptedSession | None = None
         current = asyncio.current_task()
         if current is not None:
-            self._tasks.add(current)
+            self.tasks.track(current)
         try:
             async with asyncio.timeout(HANDSHAKE_TIMEOUT + 2):
                 session = await server_handshake(reader, writer, self.identity)
-            self._sessions.add(session)
+            self.sessions.add(session)
             if session.peer_id == self.identity.peer_id:
                 # Same-device loopback connection: do not create a pending
                 # request from ourselves. The initiator will skip it too.
@@ -303,12 +350,12 @@ class _ConnectionMixin:
                 raise HandshakeError("协议版本不兼容")
             peer_name = _clean_peer_name(hello.get("name"))
             advertised_port = _validate_port(hello.get("listen_port"))
-            source_host, _source_port = self._source_address(writer)
+            source_host, _source_port = self.source_address(writer)
             if not source_host:
                 raise HandshakeError("无法识别来源 IPv6 地址")
             announced_hosts = _valid_announced_hosts(hello.get("addresses"))
 
-            contact, accepted, reason, request = self._match_incoming_peer(
+            contact, accepted, reason, request = self.contacts.match_incoming_peer(
                 session.peer_id,
                 source_host,
                 advertised_port,
@@ -318,7 +365,7 @@ class _ConnectionMixin:
             ack = {
                 "type": "hello_ack",
                 "accepted": accepted,
-                **self._local_profile_payload(),
+                **self.local_profile_payload(),
             }
             if not accepted:
                 ack["reason"] = reason
@@ -326,15 +373,17 @@ class _ConnectionMixin:
 
             if request is not None:
                 pending = self.vault.list_pending_requests()
-                self._emit("contact_request", request=request, pending=pending)
+                self.events.emit("contact_request", request=request, pending=pending)
             if not accepted:
                 if reason == "contact_request":
                     log.info("new encrypted contact request received")
                 return
             if contact is None:
                 raise HandshakeError("好友匹配失败")
-            self._emit_contact(contact, force=True)
-            await self._serve_peer_commands(session, contact)
+            self.events.emit_contact(contact, force=True)
+            if self.command_handler is None:
+                raise HandshakeError("命令处理器尚未就绪")
+            await self.command_handler(session, contact)
         except TimeoutError:
             log.debug("incoming session timed out")
         except asyncio.IncompleteReadError:
@@ -347,153 +396,7 @@ class _ConnectionMixin:
             log.exception("unexpected incoming connection error")
         finally:
             if current is not None:
-                self._tasks.discard(current)
-            await self._close_session(session)
+                self.tasks.untrack(current)
+            await self.close_session(session)
             with contextlib.suppress(Exception):
                 writer.close()
-
-    def _match_incoming_peer(
-        self,
-        peer_id: str,
-        source_host: str,
-        advertised_port: int,
-        peer_name: str,
-        announced_hosts: list[str] | None = None,
-    ) -> tuple[dict[str, Any] | None, bool, str, dict[str, Any] | None]:
-        announced_hosts = _valid_announced_hosts(announced_hosts)
-        contact = self.vault.find_contact_by_peer_id(peer_id)
-        if contact is not None:
-            if contact.get("blocked"):
-                return contact, False, "blocked", None
-            try:
-                contact = self.vault.add_or_touch_address(
-                    contact["id"],
-                    source_host,
-                    advertised_port,
-                    source="auto",
-                    success=True,
-                )
-            except (ValueError, OSError):
-                self.vault.touch_contact(contact["id"])
-                contact = self.vault.get_contact(contact["id"]) or contact
-            contact = self._add_announced_addresses(contact, announced_hosts, advertised_port)
-            return contact, True, "", None
-
-        host_matches = self.vault.contacts_matching_host(source_host)
-        if host_matches:
-            conflicting = [
-                item for item in host_matches
-                if item.get("peer_id") and item.get("peer_id") != peer_id
-            ]
-            if conflicting:
-                expected = conflicting[0].get("peer_id", "")
-                self._emit(
-                    "security_alert",
-                    contact_id=conflicting[0].get("id", ""),
-                    expected=expected,
-                    actual=peer_id,
-                    message="来自好友地址的连接使用了不同的身份指纹，已阻止。",
-                )
-                return conflicting[0], False, "identity_mismatch", None
-
-            empty_matches = [item for item in host_matches if not item.get("peer_id")]
-            chosen: dict[str, Any] | None = None
-            if len(empty_matches) == 1:
-                chosen = empty_matches[0]
-            elif empty_matches:
-                port_matches = []
-                for item in empty_matches:
-                    for address in item.get("addresses", []):
-                        if int(address.get("port", 0)) == advertised_port:
-                            port_matches.append(item)
-                            break
-                unique = {item.get("id"): item for item in port_matches}
-                if len(unique) == 1:
-                    chosen = next(iter(unique.values()))
-            if chosen is not None:
-                try:
-                    chosen = self.vault.bind_peer_identity(chosen["id"], peer_id)
-                    chosen = self.vault.add_or_touch_address(
-                        chosen["id"],
-                        source_host,
-                        advertised_port,
-                        source="auto",
-                        success=True,
-                    )
-                    chosen = self._add_announced_addresses(
-                        chosen,
-                        announced_hosts,
-                        advertised_port,
-                    )
-                    return chosen, True, "", None
-                except (ValueError, OSError):
-                    pass
-            expected = empty_matches[0].get("peer_id") if empty_matches else ""
-            self._emit(
-                "security_alert",
-                contact_id=(empty_matches[0].get("id") if empty_matches else ""),
-                expected=expected,
-                actual=peer_id,
-                message="无法将新身份安全地绑定到已有好友，已拒绝连接。",
-            )
-            return empty_matches[0] if empty_matches else None, False, "identity_mismatch", None
-
-        try:
-            request = self.vault.add_pending_request(
-                peer_id,
-                peer_name,
-                source_host,
-                advertised_port,
-            )
-        except ValueError:
-            return None, False, "invalid_identity", None
-        return None, False, "contact_request", request
-
-    def _add_announced_addresses(
-        self,
-        contact: dict[str, Any],
-        hosts: list[str],
-        port: int,
-    ) -> dict[str, Any]:
-        for host in hosts:
-            try:
-                contact = self.vault.add_or_touch_address(
-                    contact["id"],
-                    host,
-                    port,
-                    source="auto",
-                    success=False,
-                )
-            except (ValueError, OSError):
-                log.debug("failed to learn announced address %s", host, exc_info=True)
-        return contact
-
-    async def _serve_peer_commands(
-        self,
-        session: EncryptedSession,
-        contact: dict[str, Any],
-    ) -> None:
-        try:
-            async with asyncio.timeout(CONTROL_TIMEOUT):
-                command = await session.receive_control()
-        except asyncio.IncompleteReadError:
-            return
-        command_type = command.get("type")
-        if command_type == "text":
-            await self._handle_incoming_text(session, contact, command)
-        elif command_type == "file_offer":
-            await self._handle_incoming_file_offer(session, contact, command)
-        elif command_type == "stream_open":
-            await self._handle_incoming_data_stream(session, contact, command)
-        elif command_type == "friend_accept":
-            await self._handle_friend_accept(session, contact, command)
-        elif command_type == "update_offer":
-            await self._handle_incoming_update_offer(session, contact, command)
-        elif command_type == "update_pull":
-            await self._handle_incoming_update_pull(session, contact, command)
-        elif command_type == "update_decline":
-            await self._handle_incoming_update_decline(session, contact, command)
-        elif command_type == "ping":
-            await session.send_control({"type": "pong"})
-        else:
-            await session.send_control({"type": "error", "error": "unsupported_command"})

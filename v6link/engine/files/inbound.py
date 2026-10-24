@@ -7,21 +7,26 @@ import base64
 import contextlib
 import shutil
 import struct
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from ..crypto import (
+from ...crypto import (
     EncryptedSession,
 )
-from ..errors import (
+from ...errors import (
     TransferError,
 )
-from ..filestore import DEFAULT_CHUNK, AttachmentWriter
-from ..netutil import (
+from ...filestore import DEFAULT_CHUNK, AttachmentWriter
+from ...netutil import (
     human_size,
     sanitize_filename,
 )
+from ...vault import Vault
 
-from .models import (
+from ..connections import ConnectionManager
+from ..contacts import ContactService
+from ..events import EventBus
+from ..models import (
     FILE_CONSENT_TIMEOUT,
     MAX_FILE_BYTES,
     MAX_STREAMS,
@@ -39,12 +44,35 @@ from .models import (
     _parse_control_payload,
     _friendly_error,
 )
+from ..tasks import TaskRegistry
+from .state import FileState
+
+AutoExport = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
-class _InboundFileMixin:
-    """Incoming file offers, data streams, pause and cancel handling."""
+class InboundTransferService:
+    """Accepts file offers, writes encrypted chunks and manages resumability."""
 
-    async def _handle_incoming_file_offer(
+    def __init__(
+        self,
+        *,
+        vault: Vault,
+        events: EventBus,
+        tasks: TaskRegistry,
+        contacts: ContactService,
+        connections: ConnectionManager,
+        state: FileState,
+        auto_export: AutoExport,
+    ):
+        self.vault = vault
+        self.events = events
+        self.tasks = tasks
+        self.contacts = contacts
+        self.connections = connections
+        self.state = state
+        self.auto_export = auto_export
+
+    async def handle_offer(
         self,
         session: EncryptedSession,
         contact: dict[str, Any],
@@ -70,10 +98,13 @@ class _InboundFileMixin:
 
         try:
             file_id = _validate_file_id(command.get("file_id"))
-            if file_id in self._active_inbound or file_id in self._pending_offers:
+            if file_id in self.state.active_inbound or file_id in self.state.pending_offers:
                 await reject("duplicate_transfer")
                 return
-            if len(self._active_inbound) + len(self._pending_offers) >= MAX_ACTIVE_INBOUND:
+            if (
+                len(self.state.active_inbound) + len(self.state.pending_offers)
+                >= MAX_ACTIVE_INBOUND
+            ):
                 await reject("too_many_transfers")
                 return
             raw_name = str(command.get("name", "file"))
@@ -131,7 +162,7 @@ class _InboundFileMixin:
                 if channel.cancel_event.is_set():
                     if writer is not None:
                         await asyncio.to_thread(writer.abort)
-                    await self._discard_partial_message(existing, "对方取消了文件传输")
+                    await self.discard_partial(existing, "对方取消了文件传输")
                     return
                 if channel.closed.is_set():
                     if writer is not None:
@@ -150,7 +181,7 @@ class _InboundFileMixin:
             if auto_resume:
                 accepted = True
                 reason = "resume"
-                self._emit(
+                self.events.emit(
                     "file_resume_started",
                     contact_id=contact["id"],
                     file_id=file_id,
@@ -176,8 +207,8 @@ class _InboundFileMixin:
                     message=existing,
                     channel=channel,
                 )
-                self._pending_offers[file_id] = pending
-                self._emit(
+                self.state.pending_offers[file_id] = pending
+                self.events.emit(
                     "file_offer_received",
                     offer={
                         "file_id": file_id,
@@ -189,9 +220,9 @@ class _InboundFileMixin:
                         "expires_in": FILE_CONSENT_TIMEOUT,
                     },
                 )
-                accepted, reason = await self._wait_offer_decision(pending)
-                self._pending_offers.pop(file_id, None)
-                self._emit(
+                accepted, reason = await self.wait_offer_decision(pending)
+                self.state.pending_offers.pop(file_id, None)
+                self.events.emit(
                     "file_offer_closed",
                     file_id=file_id,
                     contact_id=contact["id"],
@@ -202,7 +233,7 @@ class _InboundFileMixin:
                         if writer is not None:
                             await asyncio.to_thread(writer.abort)
                         if existing is not None:
-                            await self._discard_partial_message(existing, "对方取消了文件传输")
+                            await self.discard_partial(existing, "对方取消了文件传输")
                         return
                     if channel.closed.is_set():
                         if writer is not None:
@@ -212,12 +243,11 @@ class _InboundFileMixin:
                     if writer is not None:
                         await asyncio.to_thread(writer.suspend)
                     return
-
             if channel.cancel_event.is_set():
                 if writer is not None:
                     await asyncio.to_thread(writer.abort)
                 if existing is not None:
-                    await self._discard_partial_message(existing, "对方取消了文件传输")
+                    await self.discard_partial(existing, "对方取消了文件传输")
                 return
             if channel.closed.is_set():
                 if writer is not None:
@@ -254,7 +284,7 @@ class _InboundFileMixin:
                     error="",
                     file_update=file_meta,
                 )
-                self._emit("message_updated", message=message)
+                self.events.emit("message_updated", message=message)
             else:
                 message = self.vault.add_file_message(
                     contact["id"],
@@ -263,9 +293,9 @@ class _InboundFileMixin:
                     "receiving",
                     origin_id=file_id,
                 )
-                self._emit("message_new", message=message)
+                self.events.emit("message_new", message=message)
             progress = ProgressEmitter(
-                self._event_sink,
+                self.events.sink,
                 contact["id"],
                 message["id"],
                 "in",
@@ -284,7 +314,7 @@ class _InboundFileMixin:
             )
             transfer.control = session
             transfer.channel = channel
-            self._active_inbound[file_id] = transfer
+            self.state.active_inbound[file_id] = transfer
             progress.update(received_bytes, force=True)
             have_bitmap = base64.b64encode(writer.received_bitmap()).decode("ascii")
             await session.send_control(
@@ -297,7 +327,7 @@ class _InboundFileMixin:
                     "received_bytes": received_bytes,
                 }
             )
-            self._emit_contact(contact)
+            self.events.emit_contact(contact)
             log.info(
                 "receiving encrypted file %s (%s, %d chunks, %d already present)",
                 file_id,
@@ -307,7 +337,7 @@ class _InboundFileMixin:
             )
 
             watchdog = asyncio.create_task(
-                self._watch_inbound_transfer(transfer, channel),
+                self.watch(transfer, channel),
                 name=f"file-watchdog-{file_id[:8]}",
             )
             try:
@@ -354,7 +384,7 @@ class _InboundFileMixin:
                 raise TransferError("文件接收字节数与声明大小不一致")
             await asyncio.to_thread(transfer.writer.finish)
             transfer.finalized = True
-            self._active_inbound.pop(file_id, None)
+            self.state.active_inbound.pop(file_id, None)
             message = self.vault.update_message(
                 transfer.message_id,
                 status="ready",
@@ -362,12 +392,12 @@ class _InboundFileMixin:
                 file_update={"completed_at": _now()},
             )
             transfer.progress.finish()
-            self._emit("message_updated", message=message)
+            self.events.emit("message_updated", message=message)
             await session.send_control(
                 {"type": "file_result", "file_id": file_id, "ok": True}
             )
-            self._spawn(
-                self._auto_export_incoming(message["id"], message.get("file") or {}),
+            self.tasks.spawn(
+                self.auto_export(message["id"], message.get("file") or {}),
                 name=f"auto-download-{message['id'][:8]}",
             )
             log.info("encrypted file received: %s", file_id)
@@ -375,16 +405,16 @@ class _InboundFileMixin:
             reason = _friendly_error(exc)
             if transfer is not None and not transfer.finalized:
                 if transfer.canceled:
-                    await self._cancel_inbound(transfer, reason, notify_peer=False)
+                    await self.cancel(transfer, reason, notify_peer=False)
                 else:
-                    await self._pause_inbound(
+                    await self.pause(
                         transfer,
                         reason,
-                        notify_peer=not self._stopping,
+                        notify_peer=not self.state.stopping,
                     )
             elif pending is not None:
-                self._pending_offers.pop(file_id, None)
-                self._emit(
+                self.state.pending_offers.pop(file_id, None)
+                self.events.emit(
                     "file_offer_closed",
                     file_id=file_id,
                     contact_id=contact["id"],
@@ -398,23 +428,22 @@ class _InboundFileMixin:
                 raise
         finally:
             if pending is not None:
-                self._pending_offers.pop(file_id, None)
+                self.state.pending_offers.pop(file_id, None)
             if transfer is not None and not transfer.finalized:
                 if transfer.canceled:
-                    await self._cancel_inbound(transfer, "文件传输已取消", notify_peer=False)
+                    await self.cancel(transfer, "文件传输已取消", notify_peer=False)
                 else:
-                    await self._pause_inbound(
+                    await self.pause(
                         transfer,
                         "文件传输中断",
-                        notify_peer=not self._stopping,
+                        notify_peer=not self.state.stopping,
                     )
             if writer is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(writer.suspend)
             if channel is not None:
                 await channel.close()
-
-    async def _wait_offer_decision(self, pending: _PendingFileOffer) -> tuple[bool, str]:
+    async def wait_offer_decision(self, pending: _PendingFileOffer) -> tuple[bool, str]:
         channel = pending.channel
         if channel is None:
             return False, "disconnected"
@@ -445,8 +474,8 @@ class _InboundFileMixin:
             with contextlib.suppress(BaseException):
                 await asyncio.gather(*waits, return_exceptions=True)
 
-    async def respond_file_offer(self, file_id: str, accept: bool) -> None:
-        pending = self._pending_offers.get(str(file_id))
+    async def respond_offer(self, file_id: str, accept: bool) -> None:
+        pending = self.state.pending_offers.get(str(file_id))
         if pending is None:
             raise ValueError("文件接收请求已结束或已过期")
         if pending.accepted is not None:
@@ -455,7 +484,7 @@ class _InboundFileMixin:
         pending.reason = "accepted" if accept else "declined"
         pending.decision_event.set()
 
-    async def _watch_inbound_transfer(
+    async def watch(
         self,
         transfer: _InboundTransfer,
         channel: _FileControlChannel,
@@ -479,7 +508,7 @@ class _InboundFileMixin:
         except Exception:
             log.debug("inbound transfer watchdog stopped", exc_info=True)
 
-    async def _pause_inbound(
+    async def pause(
         self,
         transfer: _InboundTransfer,
         reason: str,
@@ -490,7 +519,7 @@ class _InboundFileMixin:
             return
         transfer.finalized = True
         transfer.fail(reason)
-        self._active_inbound.pop(transfer.file_id, None)
+        self.state.active_inbound.pop(transfer.file_id, None)
         channel = transfer.channel
         if notify_peer and channel is not None and not channel.closed.is_set():
             with contextlib.suppress(Exception):
@@ -506,7 +535,7 @@ class _InboundFileMixin:
                     )
         for data_session in list(transfer.data_sessions):
             with contextlib.suppress(BaseException):
-                await self._close_session(data_session)
+                await self.connections.close_session(data_session)
         transfer.data_sessions.clear()
         try:
             await asyncio.to_thread(transfer.writer.suspend)
@@ -523,13 +552,13 @@ class _InboundFileMixin:
                 error=display_reason,
                 file_update={"paused_at": _now()},
             )
-            self._emit("message_updated", message=message)
+            self.events.emit("message_updated", message=message)
         except Exception:
             log.debug("failed to mark inbound file paused", exc_info=True)
         if channel is not None:
             await channel.close()
 
-    async def _cancel_inbound(
+    async def cancel(
         self,
         transfer: _InboundTransfer,
         reason: str,
@@ -541,7 +570,7 @@ class _InboundFileMixin:
         transfer.finalized = True
         transfer.canceled = True
         transfer.fail(reason)
-        self._active_inbound.pop(transfer.file_id, None)
+        self.state.active_inbound.pop(transfer.file_id, None)
         channel = transfer.channel
         if notify_peer and channel is not None and not channel.closed.is_set():
             with contextlib.suppress(Exception):
@@ -555,7 +584,7 @@ class _InboundFileMixin:
                     )
         for data_session in list(transfer.data_sessions):
             with contextlib.suppress(BaseException):
-                await self._close_session(data_session)
+                await self.connections.close_session(data_session)
         transfer.data_sessions.clear()
         try:
             await asyncio.to_thread(transfer.writer.abort)
@@ -569,13 +598,13 @@ class _InboundFileMixin:
                 error=reason,
                 file_update={"canceled_at": _now()},
             )
-            self._emit("message_updated", message=message)
+            self.events.emit("message_updated", message=message)
         except Exception:
             log.debug("failed to mark inbound file canceled", exc_info=True)
         if channel is not None:
             await channel.close()
 
-    async def _discard_partial_message(self, message: dict[str, Any], reason: str) -> None:
+    async def discard_partial(self, message: dict[str, Any], reason: str) -> None:
         file_meta = message.get("file") or {}
         relative = file_meta.get("enc_path")
         if relative:
@@ -589,9 +618,9 @@ class _InboundFileMixin:
                 error=reason,
                 file_update={"canceled_at": _now()},
             )
-            self._emit("message_updated", message=updated)
+            self.events.emit("message_updated", message=updated)
 
-    async def _handle_incoming_data_stream(
+    async def handle_data_stream(
         self,
         session: EncryptedSession,
         contact: dict[str, Any],
@@ -600,7 +629,7 @@ class _InboundFileMixin:
         transfer: _InboundTransfer | None = None
         try:
             file_id = _validate_file_id(command.get("file_id"))
-            transfer = self._active_inbound.get(file_id)
+            transfer = self.state.active_inbound.get(file_id)
             if (
                 transfer is None
                 or transfer.peer_id != session.peer_id

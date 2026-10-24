@@ -1,18 +1,23 @@
-"""Contacts, pending requests, settings and state snapshots."""
+"""Contacts, pending requests and incoming peer matching."""
 
 from __future__ import annotations
 
-import contextlib
-from pathlib import Path
 from typing import Any
 
+from ..vault import Vault
+
+from .events import EventBus
+from .models import log, _valid_announced_hosts
 
 
+class ContactService:
+    """Owns contact CRUD and the identity/address matching rules."""
 
-class _ContactMixin:
-    """Contacts, pending requests, settings and state snapshots."""
+    def __init__(self, vault: Vault, events: EventBus):
+        self.vault = vault
+        self.events = events
 
-    def _require_contact(self, contact_id: str) -> dict[str, Any]:
+    def require_contact(self, contact_id: str) -> dict[str, Any]:
         contact = self.vault.get_contact(contact_id)
         if contact is None:
             raise ValueError("好友不存在或已被删除")
@@ -25,12 +30,12 @@ class _ContactMixin:
         addresses: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         contact = self.vault.create_contact(name, peer_id=peer_id, addresses=addresses or [])
-        self._emit("contact_added", contact=contact)
+        self.events.emit("contact_added", contact=contact)
         return contact
 
     async def update_contact(self, contact_id: str, changes: dict[str, Any]) -> dict[str, Any]:
         contact = self.vault.update_contact(contact_id, **changes)
-        self._emit("contact_updated", contact=contact)
+        self.events.emit("contact_updated", contact=contact)
         return contact
 
     async def delete_contact(self, contact_id: str) -> None:
@@ -38,16 +43,21 @@ class _ContactMixin:
         if contact is None:
             return
         self.vault.delete_contact(contact_id)
-        self._emit("contact_deleted", contact_id=contact_id)
+        self.events.emit("contact_deleted", contact_id=contact_id)
 
-    async def accept_pending_request(self, request_id: str) -> dict[str, Any]:
+    async def accept_pending_request(self, request_id: str) -> tuple[dict[str, Any], bool]:
+        """Create the contact for a pending request.
+
+        Returns ``(contact, created)``. The facade decides whether a friend
+        acceptance notification must be pushed to the peer.
+        """
         request = self.vault.get_pending_request(request_id)
         if request is None:
             raise ValueError("好友请求已不存在")
         existing = self.vault.find_contact_by_peer_id(request["peer_id"])
         if existing is not None:
             self.vault.remove_pending_request(request_id)
-            return existing
+            return existing, False
         contact = self.vault.create_contact(
             request.get("name", "新联系人"),
             peer_id=request.get("peer_id", ""),
@@ -61,87 +71,136 @@ class _ContactMixin:
             ],
         )
         self.vault.remove_pending_request(request_id)
-        self._emit("contact_added", contact=contact)
-        self._emit("pending_requests_changed", pending=self.vault.list_pending_requests())
-        self._spawn(self._notify_friend_accepted(contact), name="friend-accept-notify")
-        return contact
+        self.events.emit("contact_added", contact=contact)
+        self.events.emit("pending_requests_changed", pending=self.vault.list_pending_requests())
+        return contact, True
 
     async def decline_pending_request(self, request_id: str) -> None:
         self.vault.remove_pending_request(request_id)
-        self._emit("pending_requests_changed", pending=self.vault.list_pending_requests())
+        self.events.emit("pending_requests_changed", pending=self.vault.list_pending_requests())
 
-    async def apply_settings(
+    def match_incoming_peer(
         self,
-        display_name: str,
-        listen_port: int,
-        parallel_streams: int | None = None,
-        downloads_dir: str | Path | None = None,
-    ) -> None:
-        name = str(display_name or "").strip()
-        if not name:
-            raise ValueError("昵称不能为空")
-        if len(name) > 40:
-            raise ValueError("昵称不能超过 40 个字符")
-        try:
-            new_port = int(listen_port)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("端口必须是数字") from exc
-        if not 1 <= new_port <= 65535:
-            raise ValueError("端口必须在 1–65535 之间")
-        target_downloads: Path | None = None
-        stored_downloads: str | None = None
-        if downloads_dir is not None:
-            raw_downloads = str(downloads_dir).strip()
-            target_downloads = (
-                Path(raw_downloads).expanduser()
-                if raw_downloads
-                else Path.home() / "Downloads"
-            )
+        peer_id: str,
+        source_host: str,
+        advertised_port: int,
+        peer_name: str,
+        announced_hosts: list[str] | None = None,
+    ) -> tuple[dict[str, Any] | None, bool, str, dict[str, Any] | None]:
+        announced_hosts = _valid_announced_hosts(announced_hosts)
+        contact = self.vault.find_contact_by_peer_id(peer_id)
+        if contact is not None:
+            if contact.get("blocked"):
+                return contact, False, "blocked", None
             try:
-                target_downloads.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                raise ValueError(f"无法使用下载目录：{exc}") from exc
-            if not target_downloads.is_dir():
-                raise ValueError("下载目录不是文件夹")
-            stored_downloads = str(target_downloads.resolve()) if raw_downloads else ""
-        old_port = self.port
-        listener_down = self._server is None
-        if new_port != old_port or listener_down:
-            server = self._server
-            self._server = None
-            if server is not None:
-                server.close()
-                with contextlib.suppress(Exception):
-                    await server.wait_closed()
-            try:
-                await self._start_listener(new_port)
-                self._started = True
-            except OSError as exc:
+                contact = self.vault.add_or_touch_address(
+                    contact["id"],
+                    source_host,
+                    advertised_port,
+                    source="auto",
+                    success=True,
+                )
+            except (ValueError, OSError):
+                self.vault.touch_contact(contact["id"])
+                contact = self.vault.get_contact(contact["id"]) or contact
+            contact = self.add_announced_addresses(contact, announced_hosts, advertised_port)
+            return contact, True, "", None
+
+        host_matches = self.vault.contacts_matching_host(source_host)
+        if host_matches:
+            conflicting = [
+                item for item in host_matches
+                if item.get("peer_id") and item.get("peer_id") != peer_id
+            ]
+            if conflicting:
+                expected = conflicting[0].get("peer_id", "")
+                self.events.emit(
+                    "security_alert",
+                    contact_id=conflicting[0].get("id", ""),
+                    expected=expected,
+                    actual=peer_id,
+                    message="来自好友地址的连接使用了不同的身份指纹，已阻止。",
+                )
+                return conflicting[0], False, "identity_mismatch", None
+
+            empty_matches = [item for item in host_matches if not item.get("peer_id")]
+            chosen: dict[str, Any] | None = None
+            if len(empty_matches) == 1:
+                chosen = empty_matches[0]
+            elif empty_matches:
+                port_matches = []
+                for item in empty_matches:
+                    for address in item.get("addresses", []):
+                        if int(address.get("port", 0)) == advertised_port:
+                            port_matches.append(item)
+                            break
+                unique = {item.get("id"): item for item in port_matches}
+                if len(unique) == 1:
+                    chosen = next(iter(unique.values()))
+            if chosen is not None:
                 try:
-                    await self._start_listener(old_port)
-                    self.port = old_port
-                except OSError:
-                    self._server = None
-                raise ValueError(f"无法监听新端口：{exc.strerror or exc}") from exc
-        self.vault.update_profile(name, new_port, parallel_streams)
-        if target_downloads is not None and stored_downloads is not None:
-            self._downloads_dir = target_downloads
-            self.vault.set_downloads_dir(stored_downloads)
-        self._emit(
-            "network",
-            listening=True,
-            port=self.port,
-            host=self.bind_host,
-        )
-        self._emit("profile_updated", profile=self.vault.profile(), settings=self.vault.settings())
+                    chosen = self.vault.bind_peer_identity(chosen["id"], peer_id)
+                    chosen = self.vault.add_or_touch_address(
+                        chosen["id"],
+                        source_host,
+                        advertised_port,
+                        source="auto",
+                        success=True,
+                    )
+                    chosen = self.add_announced_addresses(
+                        chosen,
+                        announced_hosts,
+                        advertised_port,
+                    )
+                    return chosen, True, "", None
+                except (ValueError, OSError):
+                    pass
+            expected = empty_matches[0].get("peer_id") if empty_matches else ""
+            self.events.emit(
+                "security_alert",
+                contact_id=(empty_matches[0].get("id") if empty_matches else ""),
+                expected=expected,
+                actual=peer_id,
+                message="无法将新身份安全地绑定到已有好友，已拒绝连接。",
+            )
+            return empty_matches[0] if empty_matches else None, False, "identity_mismatch", None
+
+        try:
+            request = self.vault.add_pending_request(
+                peer_id,
+                peer_name,
+                source_host,
+                advertised_port,
+            )
+        except ValueError:
+            return None, False, "invalid_identity", None
+        return None, False, "contact_request", request
+
+    def add_announced_addresses(
+        self,
+        contact: dict[str, Any],
+        hosts: list[str],
+        port: int,
+    ) -> dict[str, Any]:
+        for host in hosts:
+            try:
+                contact = self.vault.add_or_touch_address(
+                    contact["id"],
+                    host,
+                    port,
+                    source="auto",
+                    success=False,
+                )
+            except (ValueError, OSError):
+                log.debug("failed to learn announced address %s", host, exc_info=True)
+        return contact
 
     def snapshot(self) -> dict[str, Any]:
         profile = self.vault.profile()
         return {
             "profile": profile,
             "settings": self.vault.settings(),
-            "peer_id": self.identity.peer_id,
+            "peer_id": self.vault.my_peer_id,
             "contacts": self.vault.list_contacts(),
             "pending_requests": self.vault.list_pending_requests(),
-            "network": self.get_network_snapshot(),
         }

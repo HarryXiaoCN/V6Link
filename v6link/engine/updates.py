@@ -44,6 +44,11 @@ from ..updates import (
     staged_path,
     verify_manifest,
 )
+from ..vault import Vault
+
+from .connections import ConnectionManager
+from .contacts import ContactService
+from .events import EventBus
 from .models import (
     ACK_TIMEOUT,
     UPDATE_DATA_TIMEOUT,
@@ -54,6 +59,7 @@ from .models import (
     _parse_control_payload,
     log,
 )
+from .tasks import TaskRegistry
 
 
 @dataclass
@@ -137,12 +143,33 @@ class _UpdateProgress:
         self.update(self.total, force=True)
 
 
-class _UpdateMixin:
+class UpdateService:
     """Offer, stream and stage peer-to-peer application updates."""
+
+    def __init__(
+        self,
+        *,
+        vault: Vault,
+        identity: Any,
+        version: str,
+        events: EventBus,
+        tasks: TaskRegistry,
+        contacts: ContactService,
+        connections: ConnectionManager,
+    ):
+        self.vault = vault
+        self.identity = identity
+        self.version = version
+        self.events = events
+        self.tasks = tasks
+        self.contacts = contacts
+        self.connections = connections
+        self._outgoing_updates: dict[str, _OutgoingUpdate] = {}
+        self._incoming_updates: dict[str, _IncomingUpdate] = {}
 
     # ------------------------------------------------------------- outgoing side
 
-    def _prepare_local_payload(self, notes: str) -> tuple[Path, dict[str, Any]]:
+    def prepare_local_payload(self, notes: str) -> tuple[Path, dict[str, Any]]:
         data_dir = self.vault.data_dir
         ensure_dirs(data_dir)
         path, kind, filename = payload_for_offer(data_dir, version=self.version)
@@ -158,19 +185,19 @@ class _UpdateMixin:
 
     async def push_update(self, contact_id: str, notes: str = "") -> str:
         """Offer this device's program to a contact and wait for its answer."""
-        contact = self._require_contact(contact_id)
+        contact = self.contacts.require_contact(contact_id)
         if contact.get("blocked"):
             raise ValueError("该好友已被拉黑")
         if not contact.get("peer_id"):
             raise UpdateError("该好友还没有完成身份认证，无法推送更新")
-        self._prune_updates()
-        path, manifest = await asyncio.to_thread(self._prepare_local_payload, notes)
+        self.prune_updates()
+        path, manifest = await asyncio.to_thread(self.prepare_local_payload, notes)
         if manifest["size"] > MAX_UPDATE_BYTES:
             raise UpdateError("本机程序体积超出可推送上限")
         session: EncryptedSession | None = None
         ack: dict[str, Any] = {}
         try:
-            session, reply = await self._open_peer_connection(contact)
+            session, reply = await self.connections.open_peer_connection(contact)
             peer_version = str(reply.get("version") or "").strip()
             if peer_version and compare_versions(peer_version, self.version) >= 0:
                 raise UpdateError(
@@ -180,7 +207,7 @@ class _UpdateMixin:
             async with asyncio.timeout(ACK_TIMEOUT):
                 ack = await session.receive_control()
         finally:
-            await self._close_session(session)
+            await self.connections.close_session(session)
         if ack.get("type") == "error":
             raise UpdateError("对方版本不支持自动更新，请先让对方升级到本版本或更新版本")
         if ack.get("type") != "update_offer_ack":
@@ -194,7 +221,7 @@ class _UpdateMixin:
             manifest=manifest,
             expires=_now() + UPDATE_OFFER_TTL,
         )
-        self._emit(
+        self.events.emit(
             "update_invited",
             offer_id=manifest["offer_id"],
             contact_id=contact["id"],
@@ -203,8 +230,7 @@ class _UpdateMixin:
             size=manifest["size"],
         )
         return manifest["offer_id"]
-
-    async def _handle_incoming_update_decline(
+    async def handle_incoming_update_decline(
         self,
         session: EncryptedSession,
         contact: dict[str, Any],
@@ -216,7 +242,7 @@ class _UpdateMixin:
             await session.send_control({"type": "update_decline_ack", "ok": True})
         if record is None or record.contact_id != contact.get("id"):
             return
-        self._emit(
+        self.events.emit(
             "update_declined",
             offer_id=offer_id,
             contact_id=contact.get("id", ""),
@@ -225,7 +251,7 @@ class _UpdateMixin:
             reason=str(command.get("reason") or "declined")[:80],
         )
 
-    async def _handle_incoming_update_pull(
+    async def handle_incoming_update_pull(
         self,
         session: EncryptedSession,
         contact: dict[str, Any],
@@ -260,7 +286,7 @@ class _UpdateMixin:
             }
         )
         progress = _UpdateProgress(
-            self._event_sink,
+            self.events.sink,
             offer_id,
             contact["id"],
             "send",
@@ -278,7 +304,7 @@ class _UpdateMixin:
                     progress.update(sent)
         except (ConnectionError, OSError):
             log.debug("update stream aborted by peer")
-            self._emit(
+            self.events.emit(
                 "update_failed",
                 offer_id=offer_id,
                 contact_id=contact.get("id", ""),
@@ -293,7 +319,7 @@ class _UpdateMixin:
             await session.send_control(
                 {"type": "update_data_end", "offer_id": offer_id, "size": sent}
             )
-        self._emit(
+        self.events.emit(
             "update_pushed",
             offer_id=offer_id,
             contact_id=contact.get("id", ""),
@@ -304,13 +330,13 @@ class _UpdateMixin:
 
     # ------------------------------------------------------------- incoming side
 
-    async def _handle_incoming_update_offer(
+    async def handle_incoming_update_offer(
         self,
         session: EncryptedSession,
         contact: dict[str, Any],
         command: dict[str, Any],
     ) -> None:
-        self._prune_updates()
+        self.prune_updates()
         try:
             manifest = normalize_manifest(command.get("offer"))
             verify_manifest(manifest, session.remote.public_bytes)
@@ -340,7 +366,7 @@ class _UpdateMixin:
         await session.send_control(
             {"type": "update_offer_ack", "ok": True, "offer_id": manifest["offer_id"]}
         )
-        self._emit(
+        self.events.emit(
             "update_offer_received",
             offer={
                 "offer_id": manifest["offer_id"],
@@ -360,23 +386,23 @@ class _UpdateMixin:
 
     async def respond_update_offer(self, offer_id: str, accepted: bool) -> None:
         """Accept (start pulling) or decline a previously received offer."""
-        self._prune_updates()
+        self.prune_updates()
         record = self._incoming_updates.get(offer_id)
         if record is None:
             raise UpdateError("更新邀请已失效，请让对方重新推送")
-        contact = self._require_contact(record.contact_id)
+        contact = self.contacts.require_contact(record.contact_id)
         if accepted:
             if record.accepted:
                 raise UpdateError("该更新已经在接收中")
             record.accepted = True
-            record.task = self._spawn(
-                self._pull_update(record, contact),
+            record.task = self.tasks.spawn(
+                self.pull_update(record, contact),
                 name=f"update-pull-{offer_id[:8]}",
             )
             return
         self._incoming_updates.pop(offer_id, None)
-        self._spawn(
-            self._notify_update_declined(record, contact),
+        self.tasks.spawn(
+            self.notify_update_declined(record, contact),
             name=f"update-decline-{offer_id[:8]}",
         )
 
@@ -391,21 +417,21 @@ class _UpdateMixin:
             with contextlib.suppress(BaseException):
                 await task
         discard_part(self.vault.data_dir, offer_id)
-        self._emit(
+        self.events.emit(
             "update_canceled",
             offer_id=offer_id,
             contact_id=record.contact_id,
             contact_name=record.contact_name,
         )
 
-    async def _notify_update_declined(
+    async def notify_update_declined(
         self,
         record: _IncomingUpdate,
         contact: dict[str, Any],
     ) -> None:
         session: EncryptedSession | None = None
         try:
-            session, _reply = await self._open_peer_connection(contact)
+            session, _reply = await self.connections.open_peer_connection(contact)
             await session.send_control(
                 {"type": "update_decline", "offer_id": record.offer_id}
             )
@@ -415,9 +441,9 @@ class _UpdateMixin:
         except Exception:
             log.debug("failed to notify update decline", exc_info=True)
         finally:
-            await self._close_session(session)
+            await self.connections.close_session(session)
 
-    async def _pull_update(
+    async def pull_update(
         self,
         record: _IncomingUpdate,
         contact: dict[str, Any],
@@ -427,7 +453,7 @@ class _UpdateMixin:
         part = part_path(data_dir, record.offer_id)
         try:
             ensure_dirs(data_dir)
-            session, _reply = await self._open_peer_connection(contact)
+            session, _reply = await self.connections.open_peer_connection(contact)
             await session.send_control(
                 {
                     "type": "update_pull",
@@ -449,7 +475,7 @@ class _UpdateMixin:
                 raise UpdateError("更新包校验值与邀请不一致")
 
             progress = _UpdateProgress(
-                self._event_sink,
+                self.events.sink,
                 record.offer_id,
                 contact["id"],
                 "receive",
@@ -490,7 +516,7 @@ class _UpdateMixin:
             os.replace(part, final)
             progress.finish()
             self._incoming_updates.pop(record.offer_id, None)
-            self._emit(
+            self.events.emit(
                 "update_downloaded",
                 offer_id=record.offer_id,
                 contact_id=contact["id"],
@@ -509,7 +535,7 @@ class _UpdateMixin:
                 part.unlink(missing_ok=True)
             discard_part(data_dir, record.offer_id)
             self._incoming_updates.pop(record.offer_id, None)
-            self._emit(
+            self.events.emit(
                 "update_failed",
                 offer_id=record.offer_id,
                 contact_id=contact["id"],
@@ -518,11 +544,11 @@ class _UpdateMixin:
                 message=_friendly_error(exc),
             )
         finally:
-            await self._close_session(session)
+            await self.connections.close_session(session)
 
     # ------------------------------------------------------------------ helpers
 
-    def _prune_updates(self) -> None:
+    def prune_updates(self) -> None:
         now = _now()
         for offer_id, record in list(self._outgoing_updates.items()):
             if record.expires <= now:

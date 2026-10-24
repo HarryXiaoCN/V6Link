@@ -1,33 +1,41 @@
-"""Event emission helpers."""
+"""Event bus for engine -> UI notifications."""
 
 from __future__ import annotations
 
 from typing import Any
 
-
 from .models import (
+    EventSink,
     log,
     _monotonic,
 )
 
 
-class _EventMixin:
-    """Event emission helpers."""
+class EventBus:
+    """Owns the event sink and per-contact throttling state."""
 
-    def _emit(self, event_type: str, **fields: Any) -> None:
+    def __init__(self, sink: EventSink | None = None):
+        self._sink: EventSink = sink or (lambda _payload: None)
+        self._last_contact_event: dict[str, float] = {}
+
+    @property
+    def sink(self) -> EventSink:
+        return self._sink
+
+    def emit(self, event_type: str, **fields: Any) -> None:
         payload = {"type": event_type, **fields}
         try:
-            self._event_sink(payload)
+            self._sink(payload)
         except Exception:
             log.debug("event sink failed", exc_info=True)
 
-    def _emit_contact(self, contact: dict[str, Any], *, force: bool = False) -> None:
+    def emit_contact(self, contact: dict[str, Any], *, force: bool = False) -> None:
         contact_id = contact.get("id", "")
         now = _monotonic()
         if not force and now - self._last_contact_event.get(contact_id, 0.0) < 1.5:
             return
         self._last_contact_event[contact_id] = now
-        self._emit("contact_updated", contact=contact)
+        self.emit("contact_updated", contact=contact)
 
-    def _emit_error(self, message: str, *, scope: str = "general") -> None:
-        self._emit("error", scope=scope, message=message)
+    def emit_error(self, message: str, *, scope: str = "general") -> None:
+        self.emit("error", scope=scope, message=message)
